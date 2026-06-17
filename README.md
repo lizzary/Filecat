@@ -12,7 +12,7 @@ The C library is designed to be wrapped as a Go module via cgo (see
 | Platform | Backend                 | Status        |
 |----------|-------------------------|---------------|
 | Windows  | `ReadDirectoryChangesW` | Implemented   |
-| Linux    | `inotify`               | Planned       |
+| Linux    | `inotify`               | Implemented   |
 | macOS    | `FSEvents` / `kqueue`   | Planned       |
 
 ## Usage

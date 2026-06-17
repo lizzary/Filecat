@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.15)
 project(filecat LANGUAGES C VERSION 0.1.0)
 
-set(CMAKE_C_STANDARD 99)
+set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_C_EXTENSIONS OFF)
 
@@ -9,8 +9,10 @@ if(WIN32)
     set(FILECAT_PLATFORM_SOURCES src/platform/windows/filecat_win.c)
 elseif(APPLE)
     message(FATAL_ERROR "Filecat: macOS backend not implemented yet")
+elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    set(FILECAT_PLATFORM_SOURCES src/platform/linux/filecat_linux.c)
 elseif(UNIX)
-    message(FATAL_ERROR "Filecat: Linux backend not implemented yet")
+    message(FATAL_ERROR "Filecat: only Linux is supported in the UNIX family (backend uses inotify)")
 else()
     message(FATAL_ERROR "Filecat: unsupported platform")
 endif()
@@ -32,4 +34,29 @@ option(FILECAT_BUILD_EXAMPLES "Build example programs" ON)
 if(FILECAT_BUILD_EXAMPLES)
     add_executable(filecat-watch examples/watch.c)
     target_link_libraries(filecat-watch PRIVATE filecat)
+endif()
+
+option(FILECAT_BUILD_TESTS "Build test programs" ON)
+if(FILECAT_BUILD_TESTS AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    enable_testing()
+    find_package(Threads REQUIRED)
+
+    set(_FILECAT_TESTS
+        test_correctness
+        test_stress
+        test_high_load)
+
+    foreach(_t IN LISTS _FILECAT_TESTS)
+        add_executable(${_t} tests/${_t}.c)
+        target_link_libraries(${_t} PRIVATE filecat Threads::Threads)
+        target_include_directories(${_t} PRIVATE tests)
+        target_compile_options(${_t} PRIVATE -Wall -Wextra)
+        add_test(NAME ${_t} COMMAND ${_t})
+    endforeach()
+
+    # Per-test timeouts: correctness tests are quick; the high-load suite
+    # runs a 5s soak so it needs more headroom.
+    set_tests_properties(test_correctness PROPERTIES TIMEOUT 30)
+    set_tests_properties(test_stress      PROPERTIES TIMEOUT 60)
+    set_tests_properties(test_high_load   PROPERTIES TIMEOUT 90)
 endif()
