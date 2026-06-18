@@ -201,7 +201,8 @@ static void fsevents_callback(ConstFSEventStreamRef streamRef,
                             kFSEventStreamEventFlagItemInodeMetaMod |
                             kFSEventStreamEventFlagItemXattrMod |
                             kFSEventStreamEventFlagItemFinderInfoMod |
-                            kFSEventStreamEventFlagItemChangeOwner)) {
+                            kFSEventStreamEventFlagItemChangeOwner |
+                            kFSEventStreamEventFlagItemPermissionsChanged)) {
             type = FILECAT_EVENT_MODIFIED;
         } else {
             type = FILECAT_EVENT_MODIFIED;   /* fallback */
@@ -380,12 +381,12 @@ filecat_status_t filecat_next_event(filecat_watcher_t *w, filecat_event_t *out)
     filecat_status_t status = FILECAT_OK;
 
     pthread_mutex_lock(&w->mu);
+    if (atomic_load_explicit(&w->closing, memory_order_acquire)) {
+        pthread_mutex_unlock(&w->mu);
+        watcher_release(w);
+        return FILECAT_ERR_CLOSED;
+    }
     while (w->head == NULL) {
-        if (atomic_load_explicit(&w->closing, memory_order_acquire)) {
-            pthread_mutex_unlock(&w->mu);
-            watcher_release(w);
-            return FILECAT_ERR_CLOSED;
-        }
         pthread_cond_wait(&w->cv, &w->mu);
         /* Re-check closing after spurious wake */
         if (atomic_load_explicit(&w->closing, memory_order_acquire)) {
