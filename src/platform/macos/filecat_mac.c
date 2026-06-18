@@ -201,8 +201,7 @@ static void fsevents_callback(ConstFSEventStreamRef streamRef,
                             kFSEventStreamEventFlagItemInodeMetaMod |
                             kFSEventStreamEventFlagItemXattrMod |
                             kFSEventStreamEventFlagItemFinderInfoMod |
-                            kFSEventStreamEventFlagItemChangeOwner |
-                            kFSEventStreamEventFlagItemPermissionsChanged)) {
+                            kFSEventStreamEventFlagItemChangeOwner)) {
             type = FILECAT_EVENT_MODIFIED;
         } else {
             type = FILECAT_EVENT_MODIFIED;   /* fallback */
