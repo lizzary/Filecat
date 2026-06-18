@@ -8,7 +8,7 @@ set(CMAKE_C_EXTENSIONS OFF)
 if(WIN32)
     set(FILECAT_PLATFORM_SOURCES src/platform/windows/filecat_win.c)
 elseif(APPLE)
-    message(FATAL_ERROR "Filecat: macOS backend not implemented yet")
+    set(FILECAT_PLATFORM_SOURCES src/platform/macos/filecat_mac.c)
 elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     set(FILECAT_PLATFORM_SOURCES src/platform/linux/filecat_linux.c)
 elseif(UNIX)
@@ -24,6 +24,10 @@ target_include_directories(filecat
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
         $<INSTALL_INTERFACE:include>)
 
+if(APPLE)
+    target_link_libraries(filecat PRIVATE "-framework CoreServices")
+endif()
+
 if(MSVC)
     target_compile_options(filecat PRIVATE /W4)
 else()
@@ -37,8 +41,15 @@ if(FILECAT_BUILD_EXAMPLES)
 endif()
 
 option(FILECAT_BUILD_TESTS "Build test programs" ON)
-if(FILECAT_BUILD_TESTS AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
+if(FILECAT_BUILD_TESTS)
     enable_testing()
+
+    # Threads::Threads is the cross-platform CMake interface for the
+    # pthread/Win32 thread libs the helpers need. On Windows it's an
+    # empty target (we link CRT directly via _beginthreadex) but
+    # find_package keeps the call site uniform.
+    set(CMAKE_THREAD_PREFER_PTHREAD TRUE)
+    set(THREADS_PREFER_PTHREAD_FLAG TRUE)
     find_package(Threads REQUIRED)
 
     set(_FILECAT_TESTS
@@ -50,12 +61,26 @@ if(FILECAT_BUILD_TESTS AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
         add_executable(${_t} tests/${_t}.c)
         target_link_libraries(${_t} PRIVATE filecat Threads::Threads)
         target_include_directories(${_t} PRIVATE tests)
-        target_compile_options(${_t} PRIVATE -Wall -Wextra)
+        if(MSVC)
+            target_compile_options(${_t} PRIVATE /W3)
+            target_compile_definitions(${_t} PRIVATE
+                _CRT_SECURE_NO_WARNINGS
+                _CRT_NONSTDC_NO_DEPRECATE)
+        else()
+            target_compile_options(${_t} PRIVATE -Wall -Wextra)
+            # snprintf("%s" + literal, ...) into char[N] from a char[N]
+            # source triggers GCC's worst-case-N+11 analysis even when
+            # the runtime inputs are tmpdir paths bounded by the OS.
+            # We don't ship the tests, so silencing keeps the noise out.
+            if(CMAKE_C_COMPILER_ID STREQUAL "GNU")
+                target_compile_options(${_t} PRIVATE -Wno-format-truncation)
+            endif()
+        endif()
         add_test(NAME ${_t} COMMAND ${_t})
     endforeach()
 
-    # Per-test timeouts: correctness tests are quick; the high-load suite
-    # runs a 5s soak so it needs more headroom.
+    # Per-test timeouts: correctness tests are quick; the high-load
+    # suite runs a 5s soak so it needs more headroom.
     set_tests_properties(test_correctness PROPERTIES TIMEOUT 30)
     set_tests_properties(test_stress      PROPERTIES TIMEOUT 60)
     set_tests_properties(test_high_load   PROPERTIES TIMEOUT 90)

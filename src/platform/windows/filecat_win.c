@@ -189,12 +189,24 @@ static void watcher_release(filecat_watcher_t *w)
 }
 
 /* Flip the `closing` latch and close the directory handle exactly once.
- * Idempotent and thread-safe. */
+ * Idempotent and thread-safe.
+ *
+ * CancelIoEx is required to wake a consumer thread that is parked inside
+ * a synchronous ReadDirectoryChangesW: CloseHandle alone does NOT cancel
+ * an in-flight sync I/O on a directory handle — the kernel keeps the
+ * underlying file object alive until the I/O completes, and a directory-
+ * change wait completes only when an event arrives. CancelIoEx (Vista+,
+ * NULL OVERLAPPED targets every pending operation on the handle) aborts
+ * the wait so RDCW returns ERROR_OPERATION_ABORTED, which our caller
+ * maps to FILECAT_ERR_CLOSED. */
 static void watcher_close_handle(filecat_watcher_t *w)
 {
     if (InterlockedExchange(&w->closing, 1) == 0) {
         HANDLE h = (HANDLE)InterlockedExchangePointer((PVOID volatile *)&w->hDir, NULL);
-        if (h && h != INVALID_HANDLE_VALUE) CloseHandle(h);
+        if (h && h != INVALID_HANDLE_VALUE) {
+            CancelIoEx(h, NULL);
+            CloseHandle(h);
+        }
     }
 }
 
