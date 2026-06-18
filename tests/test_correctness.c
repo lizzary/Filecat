@@ -1,8 +1,14 @@
-/* Correctness tests for the Linux backend.
+/* Correctness tests for the public Filecat API.
  *
  * Each test stands alone: open a fresh watcher in a fresh tmpdir, exercise
  * one bit of the contract, destroy, clean up. Per-event timing waits are
- * generous (200 ms typical) so the suite is reliable on loaded CI hosts. */
+ * generous (200 ms typical, 500 ms on macOS via TH_SETTLE_MS) so the suite
+ * is reliable on loaded CI hosts.
+ *
+ * Platform divergences are absorbed by test_helpers.h:
+ *   - paths are compared using TH_SEP for the native separator,
+ *   - rename assertions use th_collector_contains_any_rename and gate
+ *     OLD-before-NEW ordering on TH_RENAME_TRACKED (off on macOS). */
 
 #include "test_helpers.h"
 
@@ -44,17 +50,21 @@ static int test_strerror_all_codes(void)
 
 static int test_invalid_args(void)
 {
-    filecat_watcher_t *w = NULL;
-    TH_ASSERT_STATUS(filecat_open(NULL, 0, &w), FILECAT_ERR_INVALID_ARG);
-    TH_ASSERT_STATUS(filecat_open("/tmp", 0, NULL), FILECAT_ERR_INVALID_ARG);
-    TH_ASSERT_STATUS(filecat_open("/this/path/should/not/exist/zzz", 0, &w),
-                     FILECAT_ERR_NOT_FOUND);
-
     char *dir = th_mktmp(); TH_ASSERT(dir);
-    char file[512];
-    snprintf(file, sizeof(file), "%s/regular.txt", dir);
-    TH_ASSERT_EQ(th_touch(file), 0);
+    filecat_watcher_t *w = NULL;
+
+    TH_ASSERT_STATUS(filecat_open(NULL, 0, &w),  FILECAT_ERR_INVALID_ARG);
+    TH_ASSERT_STATUS(filecat_open(dir,  0, NULL), FILECAT_ERR_INVALID_ARG);
+
+    /* A path that cannot exist on any sane FS. */
+    TH_ASSERT_STATUS(
+        filecat_open("does/not/exist/zzz-filecat-9999", 0, &w),
+        FILECAT_ERR_NOT_FOUND);
+
     /* Path is a regular file, not a directory. */
+    char file[1024];
+    snprintf(file, sizeof(file), "%s" TH_SEP "regular.txt", dir);
+    TH_ASSERT_EQ(th_touch(file), 0);
     TH_ASSERT_STATUS(filecat_open(file, 0, &w), FILECAT_ERR_INVALID_ARG);
 
     /* Valid open, then exercise next_event arg-checks. */
@@ -96,10 +106,9 @@ static int test_basic_open_close_destroy(void)
 static int test_recursive_open_succeeds(void)
 {
     char *dir = th_mktmp(); TH_ASSERT(dir);
-    /* Pre-populate a small tree. */
-    char a[512], b[512];
-    snprintf(a, sizeof(a), "%s/a", dir); TH_ASSERT_EQ(mkdir(a, 0755), 0);
-    snprintf(b, sizeof(b), "%s/a/b", dir); TH_ASSERT_EQ(mkdir(b, 0755), 0);
+    char a[1024], b[1024];
+    snprintf(a, sizeof(a), "%s" TH_SEP "a",      dir); TH_ASSERT_EQ(th_mkdir(a), 0);
+    snprintf(b, sizeof(b), "%s" TH_SEP "a" TH_SEP "b", dir); TH_ASSERT_EQ(th_mkdir(b), 0);
 
     filecat_watcher_t *w = NULL;
     TH_ASSERT_OK(filecat_open(dir, 1, &w));
@@ -117,11 +126,11 @@ static int test_create_event(void)
     th_collector_t col;
     TH_ASSERT_EQ(th_collector_start(&col, w), 0);
 
-    char path[512];
-    snprintf(path, sizeof(path), "%s/created.txt", dir);
+    char path[1024];
+    snprintf(path, sizeof(path), "%s" TH_SEP "created.txt", dir);
     TH_ASSERT_EQ(th_touch(path), 0);
 
-    th_sleep_ms(200);
+    th_sleep_ms(TH_SETTLE_MS);
     th_collector_stop(&col);
 
     TH_ASSERT(th_collector_contains(&col, FILECAT_EVENT_CREATED, "created.txt"));
@@ -136,8 +145,8 @@ static int test_create_event(void)
 static int test_modify_event(void)
 {
     char *dir = th_mktmp(); TH_ASSERT(dir);
-    char path[512];
-    snprintf(path, sizeof(path), "%s/mod.txt", dir);
+    char path[1024];
+    snprintf(path, sizeof(path), "%s" TH_SEP "mod.txt", dir);
     TH_ASSERT_EQ(th_touch(path), 0);
 
     filecat_watcher_t *w;
@@ -147,10 +156,11 @@ static int test_modify_event(void)
 
     TH_ASSERT_EQ(th_write(path, "payload"), 0);
 
-    th_sleep_ms(200);
+    th_sleep_ms(TH_SETTLE_MS);
     th_collector_stop(&col);
 
     TH_ASSERT(th_collector_contains(&col, FILECAT_EVENT_MODIFIED, "mod.txt"));
+    TH_ASSERT_EQ(col.errors, 0);
 
     th_collector_free(&col);
     filecat_destroy(w);
@@ -161,8 +171,8 @@ static int test_modify_event(void)
 static int test_remove_event(void)
 {
     char *dir = th_mktmp(); TH_ASSERT(dir);
-    char path[512];
-    snprintf(path, sizeof(path), "%s/rm.txt", dir);
+    char path[1024];
+    snprintf(path, sizeof(path), "%s" TH_SEP "rm.txt", dir);
     TH_ASSERT_EQ(th_touch(path), 0);
 
     filecat_watcher_t *w;
@@ -170,12 +180,13 @@ static int test_remove_event(void)
     th_collector_t col;
     TH_ASSERT_EQ(th_collector_start(&col, w), 0);
 
-    TH_ASSERT_EQ(unlink(path), 0);
+    TH_ASSERT_EQ(th_unlink(path), 0);
 
-    th_sleep_ms(200);
+    th_sleep_ms(TH_SETTLE_MS);
     th_collector_stop(&col);
 
     TH_ASSERT(th_collector_contains(&col, FILECAT_EVENT_REMOVED, "rm.txt"));
+    TH_ASSERT_EQ(col.errors, 0);
 
     th_collector_free(&col);
     filecat_destroy(w);
@@ -183,12 +194,17 @@ static int test_remove_event(void)
     return 0;
 }
 
-static int test_rename_event_pair_ordered(void)
+static int test_rename_events(void)
 {
+    /* Cross-platform: rename "before.txt" -> "after.txt".
+     *   Linux & Windows: strict RENAMED_OLD("before.txt") then
+     *                    RENAMED_NEW("after.txt").
+     *   macOS:           two RENAMED_OLD events, one per path
+     *                    (FSEvents doesn't pair). */
     char *dir = th_mktmp(); TH_ASSERT(dir);
-    char src[512], dst[512];
-    snprintf(src, sizeof(src), "%s/before.txt", dir);
-    snprintf(dst, sizeof(dst), "%s/after.txt",  dir);
+    char src[1024], dst[1024];
+    snprintf(src, sizeof(src), "%s" TH_SEP "before.txt", dir);
+    snprintf(dst, sizeof(dst), "%s" TH_SEP "after.txt",  dir);
     TH_ASSERT_EQ(th_touch(src), 0);
 
     filecat_watcher_t *w;
@@ -196,19 +212,29 @@ static int test_rename_event_pair_ordered(void)
     th_collector_t col;
     TH_ASSERT_EQ(th_collector_start(&col, w), 0);
 
-    TH_ASSERT_EQ(rename(src, dst), 0);
+    TH_ASSERT_EQ(th_rename(src, dst), 0);
 
-    th_sleep_ms(200);
+    th_sleep_ms(TH_SETTLE_MS);
     th_collector_stop(&col);
 
-    pthread_mutex_lock(&col.mu);
-    int i_old = th_collector_find_locked(&col, FILECAT_EVENT_RENAMED_OLD, "before.txt");
-    int i_new = th_collector_find_locked(&col, FILECAT_EVENT_RENAMED_NEW, "after.txt");
-    pthread_mutex_unlock(&col.mu);
+    /* Every backend reports some rename event for both paths. */
+    TH_ASSERT(th_collector_contains_any_rename(&col, "before.txt"));
+    TH_ASSERT(th_collector_contains_any_rename(&col, "after.txt"));
+    TH_ASSERT_EQ(col.errors, 0);
+
+#if TH_RENAME_TRACKED
+    /* Linux/Windows: the contract additionally requires OLD precede NEW
+     * with the specific event types. */
+    th_mutex_lock(&col.mu);
+    int i_old = th_collector_find_locked(&col, FILECAT_EVENT_RENAMED_OLD,
+                                         "before.txt");
+    int i_new = th_collector_find_locked(&col, FILECAT_EVENT_RENAMED_NEW,
+                                         "after.txt");
+    th_mutex_unlock(&col.mu);
     TH_ASSERT(i_old >= 0);
     TH_ASSERT(i_new >= 0);
-    /* Contract: RENAMED_OLD precedes RENAMED_NEW. */
     TH_ASSERT(i_old < i_new);
+#endif
 
     th_collector_free(&col);
     filecat_destroy(w);
@@ -225,23 +251,27 @@ static int test_recursive_subdir_events(void)
     th_collector_t col;
     TH_ASSERT_EQ(th_collector_start(&col, w), 0);
 
-    char sub[512];
-    snprintf(sub, sizeof(sub), "%s/sub", dir);
-    TH_ASSERT_EQ(mkdir(sub, 0755), 0);
-    /* Give the consumer time to install the new watch before we write
-     * inside the subdirectory — otherwise IN_CREATE for the file races
-     * the inotify_add_watch and may legitimately be missed. */
-    th_sleep_ms(150);
+    char sub[1024];
+    snprintf(sub, sizeof(sub), "%s" TH_SEP "sub", dir);
+    TH_ASSERT_EQ(th_mkdir(sub), 0);
 
-    char file[512];
-    snprintf(file, sizeof(file), "%s/inside.txt", sub);
+    /* Linux inotify needs the consumer to install a watch on the new
+     * subdir before we write inside it (the IN_CREATE for the file
+     * otherwise races inotify_add_watch). The wait is harmless on
+     * Windows/macOS where recursion is built into the syscall. */
+    th_sleep_ms(TH_SETTLE_MS);
+
+    char file[1024];
+    snprintf(file, sizeof(file), "%s" TH_SEP "inside.txt", sub);
     TH_ASSERT_EQ(th_touch(file), 0);
 
-    th_sleep_ms(200);
+    th_sleep_ms(TH_SETTLE_MS);
     th_collector_stop(&col);
 
     TH_ASSERT(th_collector_contains(&col, FILECAT_EVENT_CREATED, "sub"));
-    TH_ASSERT(th_collector_contains(&col, FILECAT_EVENT_CREATED, "sub/inside.txt"));
+    TH_ASSERT(th_collector_contains(&col, FILECAT_EVENT_CREATED,
+                                    "sub" TH_SEP "inside.txt"));
+    TH_ASSERT_EQ(col.errors, 0);
 
     th_collector_free(&col);
     filecat_destroy(w);
@@ -252,26 +282,29 @@ static int test_recursive_subdir_events(void)
 static int test_non_recursive_drops_subdir_events(void)
 {
     char *dir = th_mktmp(); TH_ASSERT(dir);
-    char sub[512];
-    snprintf(sub, sizeof(sub), "%s/sub", dir);
-    TH_ASSERT_EQ(mkdir(sub, 0755), 0);
+    char sub[1024];
+    snprintf(sub, sizeof(sub), "%s" TH_SEP "sub", dir);
+    TH_ASSERT_EQ(th_mkdir(sub), 0);
 
     filecat_watcher_t *w;
-    TH_ASSERT_OK(filecat_open(dir, 0, &w));   /* not recursive */
+    TH_ASSERT_OK(filecat_open(dir, 0, &w));   /* recursive=0 */
     th_collector_t col;
     TH_ASSERT_EQ(th_collector_start(&col, w), 0);
 
-    char rfile[512], sfile[512];
-    snprintf(rfile, sizeof(rfile), "%s/at-root.txt", dir);
-    snprintf(sfile, sizeof(sfile), "%s/inside.txt",  sub);
+    char rfile[1024], sfile[1024];
+    snprintf(rfile, sizeof(rfile), "%s" TH_SEP "at-root.txt", dir);
+    snprintf(sfile, sizeof(sfile), "%s" TH_SEP "inside.txt",  sub);
     TH_ASSERT_EQ(th_touch(rfile), 0);
     TH_ASSERT_EQ(th_touch(sfile), 0);
 
-    th_sleep_ms(200);
+    th_sleep_ms(TH_SETTLE_MS);
     th_collector_stop(&col);
 
-    TH_ASSERT(th_collector_contains(&col, FILECAT_EVENT_CREATED, "at-root.txt"));
-    TH_ASSERT(!th_collector_contains(&col, FILECAT_EVENT_CREATED, "sub/inside.txt"));
+    TH_ASSERT(th_collector_contains(&col, FILECAT_EVENT_CREATED,
+                                    "at-root.txt"));
+    TH_ASSERT(!th_collector_contains(&col, FILECAT_EVENT_CREATED,
+                                     "sub" TH_SEP "inside.txt"));
+    TH_ASSERT_EQ(col.errors, 0);
 
     th_collector_free(&col);
     filecat_destroy(w);
@@ -285,23 +318,23 @@ static int test_close_from_another_thread_unblocks(void)
     filecat_watcher_t *w;
     TH_ASSERT_OK(filecat_open(dir, 0, &w));
 
-    struct th_delayed_close_arg ca = { w, 200 };
-    pthread_t closer;
-    TH_ASSERT_EQ(pthread_create(&closer, NULL, th_delayed_close_, &ca), 0);
+    struct th_delayed_close_arg ca = { w, TH_SETTLE_MS };
+    th_thread_t closer;
+    TH_ASSERT_EQ(th_thread_create(&closer, th_delayed_close_, &ca), 0);
 
-    struct timespec t0, t1;
-    clock_gettime(CLOCK_MONOTONIC, &t0);
+    th_time_t t0 = th_now();
     filecat_event_t ev;
     filecat_status_t s = filecat_next_event(w, &ev);
-    clock_gettime(CLOCK_MONOTONIC, &t1);
+    th_time_t t1 = th_now();
 
-    pthread_join(closer, NULL);
+    th_thread_join(closer);
 
     TH_ASSERT_STATUS(s, FILECAT_ERR_CLOSED);
-    long ms = th_elapsed_ms(&t0, &t1);
-    /* close was scheduled at 200 ms; expect unblock between 150–1000 ms. */
-    TH_ASSERT(ms >= 150);
-    TH_ASSERT(ms <  1000);
+    long ms = th_elapsed_ms(t0, t1);
+    /* close was scheduled at TH_SETTLE_MS; expect unblock in a wide
+     * window — generous to absorb scheduler jitter on loaded hosts. */
+    TH_ASSERT(ms >= TH_SETTLE_MS - 100);
+    TH_ASSERT(ms <  TH_SETTLE_MS * 10);
 
     /* Re-entry continues to return CLOSED. */
     TH_ASSERT_STATUS(filecat_next_event(w, &ev), FILECAT_ERR_CLOSED);
@@ -318,16 +351,17 @@ static int test_destroy_from_another_thread_unblocks(void)
     TH_ASSERT_OK(filecat_open(dir, 0, &w));
 
     struct th_blocking_next_arg na = { w, FILECAT_OK };
-    pthread_t blocker;
-    TH_ASSERT_EQ(pthread_create(&blocker, NULL, th_blocking_next_, &na), 0);
+    th_thread_t blocker;
+    TH_ASSERT_EQ(th_thread_create(&blocker, th_blocking_next_, &na), 0);
 
-    /* Ensure the consumer is parked in poll() before destroying. */
-    th_sleep_ms(200);
+    /* Ensure the consumer is parked inside filecat_next_event before
+     * destroying. */
+    th_sleep_ms(TH_SETTLE_MS);
     filecat_destroy(w);
-    pthread_join(blocker, NULL);
+    th_thread_join(blocker);
 
     TH_ASSERT_STATUS(na.result, FILECAT_ERR_CLOSED);
-    /* w is invalid here — must not touch it again. */
+    /* w is invalid past this point — must not touch it again. */
 
     th_rmtree(dir); free(dir);
     return 0;
@@ -336,7 +370,7 @@ static int test_destroy_from_another_thread_unblocks(void)
 static int test_two_watchers_in_one_dir(void)
 {
     /* Two independent watchers on the same directory must each receive
-     * their own copy of every event (separate inotify instances). */
+     * their own copy of every event. */
     char *dir = th_mktmp(); TH_ASSERT(dir);
     filecat_watcher_t *w1, *w2;
     TH_ASSERT_OK(filecat_open(dir, 0, &w1));
@@ -346,11 +380,11 @@ static int test_two_watchers_in_one_dir(void)
     TH_ASSERT_EQ(th_collector_start(&c1, w1), 0);
     TH_ASSERT_EQ(th_collector_start(&c2, w2), 0);
 
-    char path[512];
-    snprintf(path, sizeof(path), "%s/twin.txt", dir);
+    char path[1024];
+    snprintf(path, sizeof(path), "%s" TH_SEP "twin.txt", dir);
     TH_ASSERT_EQ(th_touch(path), 0);
 
-    th_sleep_ms(200);
+    th_sleep_ms(TH_SETTLE_MS);
     th_collector_stop(&c1);
     th_collector_stop(&c2);
 
@@ -374,7 +408,7 @@ int main(void)
     TH_RUN(test_create_event);
     TH_RUN(test_modify_event);
     TH_RUN(test_remove_event);
-    TH_RUN(test_rename_event_pair_ordered);
+    TH_RUN(test_rename_events);
     TH_RUN(test_recursive_subdir_events);
     TH_RUN(test_non_recursive_drops_subdir_events);
     TH_RUN(test_close_from_another_thread_unblocks);
