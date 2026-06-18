@@ -159,14 +159,6 @@ static int test_modify_event(void)
     th_sleep_ms(TH_SETTLE_MS);
     th_collector_stop(&col);
 
-    // ----- TODO: remove this after finished debugging -----
-    fprintf(stderr, "DEBUG: collector received %d events\n", col.n);
-    for (int i = 0; i < col.n; i++) {
-        fprintf(stderr, "  event[%d]: type=%d, path=\"%s\"\n",
-                i, col.events[i].type, col.events[i].path);
-    }
-    // -----------------------
-
     TH_ASSERT(th_collector_contains(&col, FILECAT_EVENT_MODIFIED, "mod.txt"));
     TH_ASSERT_EQ(col.errors, 0);
 
