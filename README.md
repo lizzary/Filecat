@@ -56,16 +56,133 @@ with `\\?\` or `\\.\` are passed through unchanged.
 
 ## Build
 
+Pure CMake, no external dependencies. The library, the example CLI, and the
+test suite all build out of the same tree.
+
+### Quick start
+
 ```bash
-cmake -B build
+cmake -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build
+ctest --test-dir build --output-on-failure
+```
+
+### Per-platform commands
+
+**Windows (MinGW):**
+
+```bash
+cmake -B build -G "MinGW Makefiles" -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j
+```
+
+**Windows (Visual Studio / MSVC):** multi-config generator, pass `--config`:
+
+```powershell
+cmake -B build -G "Visual Studio 17 2022" -A x64
+cmake --build build --config Release
+ctest --test-dir build -C Release --output-on-failure
+```
+
+Artifacts land under `build/Release/` instead of `build/`.
+
+**Linux:**
+
+```bash
+cmake -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j
+```
+
+**macOS:** the `APPLE` branch is detected automatically and `-framework
+CoreServices` is linked for FSEvents — no extra flags.
+
+```bash
+cmake -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j
+```
+
+### Build outputs
+
+In `build/` (or `build/Release/` on MSVC):
+
+| File | What it is |
+|---|---|
+| `libfilecat.a` / `filecat.lib` | the static library |
+| `filecat-watch` / `.exe`       | demo CLI; usage below |
+| `test_correctness` / `.exe`    | public-API correctness suite |
+| `test_stress` / `.exe`         | moderate sustained stress |
+| `test_high_load` / `.exe`      | extreme load + overflow recovery + 5s soak |
+
+### CMake options
+
+| Option | Default | Effect |
+|---|---|---|
+| `FILECAT_BUILD_EXAMPLES` | `ON` | build `filecat-watch` |
+| `FILECAT_BUILD_TESTS`    | `ON` | build the three test executables |
+| `CMAKE_BUILD_TYPE`       | (none) | `Debug`, `Release`, `RelWithDebInfo`, `MinSizeRel` |
+
+Library-only build:
+
+```bash
+cmake -B build -DFILECAT_BUILD_EXAMPLES=OFF -DFILECAT_BUILD_TESTS=OFF
 cmake --build build
 ```
 
-This produces `libfilecat.a` and the demo CLI `filecat-watch`:
+Out-of-source builds are encouraged — multiple build directories
+(`build-debug/`, `build-release/`, `build-asan/`) can coexist.
+
+ASan/UBSan (POSIX only):
 
 ```bash
-./build/filecat-watch.exe C:/some/dir 1
+cmake -B build-asan -DCMAKE_BUILD_TYPE=Debug \
+    -DCMAKE_C_FLAGS="-fsanitize=address,undefined"
+cmake --build build-asan
+ctest --test-dir build-asan --output-on-failure
 ```
+
+## Tests
+
+The test suite is cross-platform: the same `test_correctness`,
+`test_stress`, and `test_high_load` executables run on Linux, macOS, and
+Windows. Helpers absorb the platform-specific bits (path separator,
+threading primitives, rename-event pairing semantics).
+
+Run everything via `ctest`:
+
+```bash
+ctest --test-dir build --output-on-failure
+```
+
+Run one suite:
+
+```bash
+ctest --test-dir build -R test_correctness --output-on-failure
+```
+
+Or invoke the binaries directly for per-test detail:
+
+```bash
+./build/test_correctness          # POSIX
+./build/test_correctness.exe      # Windows MinGW
+./build/Release/test_correctness.exe   # Windows MSVC
+```
+
+CTest enforces per-suite timeouts (30 s / 60 s / 90 s, see
+[CMakeLists.txt](CMakeLists.txt)) and will kill a hung run rather than
+let CI stall.
+
+## Demo
+
+`filecat-watch` is a 70-line CLI built from
+[examples/watch.c](examples/watch.c) — useful for smoke-testing the
+library against a real directory:
+
+```bash
+./build/filecat-watch /some/dir 1          # POSIX
+./build/filecat-watch.exe C:/some/dir 1    # Windows
+```
+
+The second argument is the `recursive` flag (`0` or `1`). Ctrl+C exits.
 
 ## License
 
