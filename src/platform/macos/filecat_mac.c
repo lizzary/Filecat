@@ -1,49 +1,77 @@
+/* Filecat — macOS backend (FSEvents + dispatch queue + pthread condvar).
+ *
+ * The Windows backend's lifecycle/locking model (refcount + two set-once
+ * latches) maps onto macOS verbatim; only the I/O substrate differs. Here
+ * FSEvents pushes batches of events into a callback running on a serial
+ * dispatch queue; the callback strips the watch root, classifies each event,
+ * appends nodes to a linked-list queue, and signals a pthread_cond_t that
+ * filecat_next_event blocks on.
+ *
+ * Rename note: FSEvents sets `kFSEventStreamEventFlagItemRenamed` on both
+ * sides of a rename without pairing them. We deliberately do NOT infer
+ * OLD vs NEW via lstat or any other tracking — every renamed item is
+ * surfaced as FILECAT_EVENT_RENAMED_OLD and the caller is expected to
+ * interpret raw events. This is intentional: the library does not synthesize
+ * higher-level semantics from native flags on macOS.
+ */
+
+/* Force dispatch types to be plain C handles (not Objective-C objects under
+ * ARC) so dispatch_release / dispatch_retain are real function calls in
+ * this translation unit. Must precede any Apple system header; the #undef
+ * defends against `-DOS_OBJECT_USE_OBJC=1` on the command line. */
+#ifdef OS_OBJECT_USE_OBJC
+#undef OS_OBJECT_USE_OBJC
+#endif
+#define OS_OBJECT_USE_OBJC 0
+
 #include "filecat/filecat.h"
 
 #include <CoreServices/CoreServices.h>
+#include <dispatch/dispatch.h>
+#include <errno.h>
 #include <pthread.h>
 #include <stdatomic.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
-#include <errno.h>
 
-/* ---- internal event queue node ----------------------------------------- */
-
+/* ---- per-event node in the producer→consumer linked-list queue --------- */
 struct fc_node {
     filecat_event_type_t type;
-    char                *rel_path;   /* malloc'd, relative to root */
+    char                *rel_path;   /* malloc'd UTF-8 relative path, owned */
     struct fc_node      *next;
 };
 
-/* ---- watcher structure -------------------------------------------------- */
-
 struct filecat_watcher {
-    /* config */
-    char    *root;          /* canonical absolute path from realpath() */
-    size_t   root_len;      /* strlen(root) */
-    int      recursive;     /* 0 -> filter out events not directly in root */
+    /* configuration */
+    char  *root;        /* canonical absolute path from realpath() */
+    size_t root_len;    /* strlen(root); used to strip prefix      */
+    int    recursive;   /* 0 -> drop events deeper than one level  */
 
-    /* FSEvents */
+    /* FSEvents stream and the serial queue its callback runs on */
     FSEventStreamRef stream;
-    CFRunLoopRef     run_loop;      /* the loop the stream is scheduled on */
-    pthread_t        run_loop_thr;  /* thread that runs CFRunLoopRun() */
+    dispatch_queue_t queue;
 
-    /* event queue: producer = FS callback, consumer = next_event */
-    pthread_mutex_t  mu;
-    pthread_cond_t   cv;
-    struct fc_node  *head;
-    struct fc_node  *tail;
+    /* producer/consumer queue: FSEvents callback appends, next_event pops */
+    pthread_mutex_t mu;
+    pthread_cond_t  cv;
+    struct fc_node *head;
+    struct fc_node *tail;
+    int             overflow_pending;   /* sticky; consumed by next_event */
 
-    /* scratch buffer for the event.path the consumer is currently holding */
-    char    *utf8_path;
-    size_t   utf8_capacity;
+    /* scratch buffer aliased by event.path until the next call/close */
+    char  *utf8_path;
+    size_t utf8_capacity;
 
-    /* lifecycle, copied from Windows/Linux model */
-    atomic_int refcount;    /* 1 owner + 1 per in-flight call */
-    atomic_int closing;     /* set-once latch */
-    atomic_int destroyed;   /* set-once latch */
+    /* lifecycle (mirror of Windows / Linux backends):
+     *   refcount  = 1 owner ref + 1 per in-flight call; last drop frees.
+     *   closing   = set-once latch; gates FSEvents teardown exactly once.
+     *   destroyed = set-once latch; gates owner-ref drop exactly once. */
+    atomic_int refcount;
+    atomic_int closing;
+    atomic_int destroyed;
 };
 
 /* ---- error mapping ----------------------------------------------------- */
@@ -63,19 +91,171 @@ static filecat_status_t map_errno(int e)
     }
 }
 
-/* ---- refcount + close latches -------------------------------------------
+/* ---- FSEvents flag → filecat event type --------------------------------
  *
- * Mirror the Windows/Linux model exactly.
+ * FSEvents flags are a bitmask: a single batch entry may set several at
+ * once (e.g. Created|Modified when a file is created and written before
+ * the batch is flushed). We collapse to ONE event by priority below.
+ */
+static filecat_event_type_t map_flags(FSEventStreamEventFlags f)
+{
+    if (f & kFSEventStreamEventFlagItemRenamed) {
+        /* FSEvents reports the same flag on both sides of a rename and
+         * never tells us which is which. By design we don't infer; the
+         * raw event is exposed as RENAMED_OLD. */
+        return FILECAT_EVENT_RENAMED_OLD;
+    }
+    if (f & kFSEventStreamEventFlagItemRemoved) return FILECAT_EVENT_REMOVED;
+    if (f & kFSEventStreamEventFlagItemCreated) return FILECAT_EVENT_CREATED;
+    if (f & ( kFSEventStreamEventFlagItemModified
+            | kFSEventStreamEventFlagItemInodeMetaMod
+            | kFSEventStreamEventFlagItemXattrMod
+            | kFSEventStreamEventFlagItemFinderInfoMod
+            | kFSEventStreamEventFlagItemChangeOwner))
+        return FILECAT_EVENT_MODIFIED;
+    return FILECAT_EVENT_MODIFIED;
+}
+
+/* ---- relative-path computation ---------------------------------------- *
+ *
+ * FSEvents hands back absolute, canonical UTF-8 paths under (or equal to)
+ * the watch root. Returns 1 (accept) on success and fills *rel/*rel_len
+ * with a pointer into `abs` plus its length, or 0 if the event should be
+ * dropped (root itself, outside root, or below one level when !recursive).
+ */
+static int compute_rel(const filecat_watcher_t *w,
+                       const char *abs, size_t abs_len,
+                       const char **rel_out, size_t *rel_len_out)
+{
+    /* Trim trailing '/' that FSEvents occasionally appends to directory
+     * paths; otherwise the non-recursive check below would reject a
+     * legitimate "dir/" as if it had an internal separator. */
+    while (abs_len > w->root_len && abs[abs_len - 1] == '/') abs_len--;
+
+    if (abs_len < w->root_len) return 0;
+    if (memcmp(abs, w->root, w->root_len) != 0) return 0;
+
+    /* Exact match = the watch root itself; we never emit those (matches
+     * Windows ReadDirectoryChangesW, which doesn't report the dir handle's
+     * own changes). */
+    if (abs_len == w->root_len) return 0;
+
+    const char *rel;
+    if (w->root_len == 1 && w->root[0] == '/') {
+        /* root "/": no separator to skip after the prefix */
+        rel = abs + 1;
+    } else {
+        if (abs[w->root_len] != '/') return 0;   /* prefix-with-no-sep, e.g. "/foo" vs "/foobar" */
+        rel = abs + w->root_len + 1;
+    }
+    size_t rel_len = (size_t)((abs + abs_len) - rel);
+
+    if (!w->recursive) {
+        /* recursive=0: accept only events whose parent IS the root —
+         * i.e. no '/' inside the relative path. */
+        for (size_t k = 0; k < rel_len; k++) {
+            if (rel[k] == '/') return 0;
+        }
+    }
+    *rel_out     = rel;
+    *rel_len_out = rel_len;
+    return 1;
+}
+
+/* ---- FSEvents callback (runs on the serial dispatch queue) ------------ *
+ *
+ * We build a local linked-list of nodes BEFORE touching the shared mutex,
+ * then splice it in at the end — keeps the consumer's wake-up critical
+ * section short, and we never call malloc while holding the mutex.
+ */
+static void fsevents_cb(ConstFSEventStreamRef stream,
+                        void *info,
+                        size_t numEvents,
+                        void *eventPaths,
+                        const FSEventStreamEventFlags eventFlags[],
+                        const FSEventStreamEventId   eventIds[])
+{
+    (void)stream; (void)eventIds;
+    filecat_watcher_t *w = (filecat_watcher_t *)info;
+    char **paths = (char **)eventPaths;
+
+    struct fc_node *local_head = NULL, *local_tail = NULL;
+    int local_overflow = 0;
+
+    for (size_t i = 0; i < numEvents; i++) {
+        FSEventStreamEventFlags fl = eventFlags[i];
+
+        /* Drop/scan flags → OVERFLOW. We still process the other events
+         * in the batch; the consumer will see one OVERFLOW followed by
+         * the rest, matching the Linux/Windows recovery semantics. */
+        if (fl & ( kFSEventStreamEventFlagMustScanSubDirs
+                 | kFSEventStreamEventFlagUserDropped
+                 | kFSEventStreamEventFlagKernelDropped)) {
+            local_overflow = 1;
+        }
+
+        const char *abs = paths[i];
+        if (!abs) continue;
+        size_t abs_len = strlen(abs);
+
+        const char *rel; size_t rel_len;
+        if (!compute_rel(w, abs, abs_len, &rel, &rel_len)) continue;
+
+        char *rp = (char *)malloc(rel_len + 1);
+        if (!rp) continue;   /* on OOM, drop just this event */
+        memcpy(rp, rel, rel_len);
+        rp[rel_len] = '\0';
+
+        struct fc_node *node = (struct fc_node *)malloc(sizeof(*node));
+        if (!node) { free(rp); continue; }
+        node->type     = map_flags(fl);
+        node->rel_path = rp;
+        node->next     = NULL;
+
+        if (local_tail) local_tail->next = node;
+        else            local_head       = node;
+        local_tail = node;
+    }
+
+    pthread_mutex_lock(&w->mu);
+    if (atomic_load_explicit(&w->closing, memory_order_acquire)) {
+        /* Watcher is being torn down; drop the local list. */
+        pthread_mutex_unlock(&w->mu);
+        while (local_head) {
+            struct fc_node *n = local_head;
+            local_head = n->next;
+            free(n->rel_path);
+            free(n);
+        }
+        return;
+    }
+    if (local_head) {
+        if (w->tail) w->tail->next = local_head;
+        else         w->head       = local_head;
+        w->tail = local_tail;
+    }
+    if (local_overflow) w->overflow_pending = 1;
+    if (local_head || local_overflow) pthread_cond_signal(&w->cv);
+    pthread_mutex_unlock(&w->mu);
+}
+
+/* ---- refcount + close latches ----------------------------------------- *
+ *
+ * Lifetime model (verbatim mirror of the Windows backend):
+ *   - filecat_open initializes refcount=1 (the owner ref).
+ *   - filecat_next_event / filecat_close retain at entry, release at exit.
+ *   - filecat_destroy CAS-sets `destroyed` (so only one call drops the
+ *     owner ref) and then releases.
+ *   - The last release does the real free.
  */
 
 static void watcher_free(filecat_watcher_t *w)
 {
-    if (w->stream) {
-        /* Should have been invalidated/released already, but be safe. */
-        FSEventStreamInvalidate(w->stream);
-        FSEventStreamRelease(w->stream);
-    }
-    /* Free the queue */
+    /* The stream has been torn down inside watcher_close_internal by the
+     * time we get here; the queue is still owned by us. */
+    if (w->queue) dispatch_release(w->queue);
+
+    /* Drain any events that were enqueued but never consumed. */
     struct fc_node *n = w->head;
     while (n) {
         struct fc_node *next = n->next;
@@ -83,10 +263,11 @@ static void watcher_free(filecat_watcher_t *w)
         free(n);
         n = next;
     }
-    free(w->utf8_path);
-    free(w->root);
-    pthread_mutex_destroy(&w->mu);
+
     pthread_cond_destroy(&w->cv);
+    pthread_mutex_destroy(&w->mu);
+    free(w->root);
+    free(w->utf8_path);
     free(w);
 }
 
@@ -101,184 +282,42 @@ static void watcher_release(filecat_watcher_t *w)
         watcher_free(w);
 }
 
-/* Close the FSEventStream and stop the run loop exactly once.
- * Idempotent and thread-safe. */
+/* No-op used by dispatch_sync_f to "fence" the serial queue: when it
+ * runs, every previously-submitted callback has finished. */
+static void noop_dispatch_fn(void *ctx) { (void)ctx; }
+
 static void watcher_close_internal(filecat_watcher_t *w)
 {
     int expected = 0;
-    if (!atomic_compare_exchange_strong(&w->closing, &expected, 1))
-        return;
+    if (!atomic_compare_exchange_strong(&w->closing, &expected, 1)) return;
 
+    /* Tear down the FSEvents stream. After Invalidate no new callback will
+     * be delivered for this stream. Release drops our +1 ref. */
     if (w->stream) {
         FSEventStreamStop(w->stream);
         FSEventStreamInvalidate(w->stream);
-    }
-    if (w->run_loop)
-        CFRunLoopStop(w->run_loop);
-
-    /* Wake any consumer blocked in next_event. */
-    pthread_mutex_lock(&w->mu);
-    pthread_cond_broadcast(&w->cv);
-    pthread_mutex_unlock(&w->mu);
-
-    /* Wait for the run-loop thread to exit. It releases the stream. */
-    if (w->run_loop_thr)
-        pthread_join(w->run_loop_thr, NULL);
-    w->run_loop_thr = 0;
-}
-
-/* ---- FSEvents callback ------------------------------------------------- */
-
-static void fsevents_callback(ConstFSEventStreamRef streamRef,
-                              void *clientCallBackInfo,
-                              size_t numEvents,
-                              void *eventPaths,
-                              const FSEventStreamEventFlags eventFlags[],
-                              const FSEventStreamEventId eventIds[])
-{
-    filecat_watcher_t *w = (filecat_watcher_t *)clientCallBackInfo;
-    char **paths = (char **)eventPaths;
-
-    /* If the watcher is closing, drop all events. */
-    if (atomic_load_explicit(&w->closing, memory_order_acquire))
-        return;
-
-    for (size_t i = 0; i < numEvents; i++) {
-        const char *abs = paths[i];
-        uint32_t flags = eventFlags[i];
-
-        /* ----- overflow handling ----- */
-        if (flags & (kFSEventStreamEventFlagMustScanSubDirs |
-                     kFSEventStreamEventFlagUserDropped |
-                     kFSEventStreamEventFlagKernelDropped)) {
-            struct fc_node *node = (struct fc_node *)malloc(sizeof(*node));
-            if (!node) continue;  /* drop the overflow event; better than crashing */
-            node->type = 0;       /* special marker: overflow */
-            node->rel_path = NULL;
-            node->next = NULL;
-
-            pthread_mutex_lock(&w->mu);
-            if (w->tail) {
-                w->tail->next = node;
-                w->tail = node;
-            } else {
-                w->head = w->tail = node;
-            }
-            pthread_cond_signal(&w->cv);
-            pthread_mutex_unlock(&w->mu);
-            continue;
-        }
-
-        /* ----- filter recursive ----- */
-        /* Ensure event is inside root */
-        if (strncmp(abs, w->root, w->root_len) != 0)
-            continue;
-        const char *rel = abs + w->root_len;
-        if (*rel == '/') rel++;   /* skip the separator */
-
-        /* Non-recursive: only allow events where the parent is exactly root,
-         * i.e. rel contains no '/'. */
-        if (!w->recursive) {
-            if (strchr(rel, '/') != NULL)
-                continue;
-        }
-
-        /* ----- classify event ----- */
-        filecat_event_type_t type;
-        if (flags & kFSEventStreamEventFlagItemRenamed) {
-            /* Determine old vs new by checking existence of the item.
-             * If the item exists, it's the new name; otherwise old. */
-            struct stat st;
-            if (lstat(abs, &st) == 0)
-                type = FILECAT_EVENT_RENAMED_NEW;
-            else
-                type = FILECAT_EVENT_RENAMED_OLD;
-        } else if (flags & kFSEventStreamEventFlagItemRemoved) {
-            type = FILECAT_EVENT_REMOVED;
-        } else if (flags & kFSEventStreamEventFlagItemCreated) {
-            type = FILECAT_EVENT_CREATED;
-        } else if (flags & (kFSEventStreamEventFlagItemModified |
-                            kFSEventStreamEventFlagItemInodeMetaMod |
-                            kFSEventStreamEventFlagItemXattrMod |
-                            kFSEventStreamEventFlagItemFinderInfoMod |
-                            kFSEventStreamEventFlagItemChangeOwner)) {
-            type = FILECAT_EVENT_MODIFIED;
-        } else {
-            type = FILECAT_EVENT_MODIFIED;   /* fallback */
-        }
-
-        /* ----- enqueue node ----- */
-        char *rel_copy = strdup(rel);
-        if (!rel_copy) continue;  /* out of memory, drop this event */
-
-        struct fc_node *node = (struct fc_node *)malloc(sizeof(*node));
-        if (!node) {
-            free(rel_copy);
-            continue;
-        }
-        node->type = type;
-        node->rel_path = rel_copy;
-        node->next = NULL;
-
-        pthread_mutex_lock(&w->mu);
-        if (w->tail) {
-            w->tail->next = node;
-            w->tail = node;
-        } else {
-            w->head = w->tail = node;
-        }
-        pthread_cond_signal(&w->cv);
-        pthread_mutex_unlock(&w->mu);
-    }
-}
-
-/* ---- run-loop thread --------------------------------------------------- */
-
-static void *run_loop_thread(void *arg)
-{
-    filecat_watcher_t *w = (filecat_watcher_t *)arg;
-
-    w->run_loop = CFRunLoopGetCurrent();
-
-    /* Signal that run_loop is assigned. */
-    pthread_mutex_lock(&w->mu);
-    pthread_cond_broadcast(&w->cv);
-    pthread_mutex_unlock(&w->mu);
-
-    FSEventStreamScheduleWithRunLoop(w->stream, w->run_loop, kCFRunLoopDefaultMode);
-    FSEventStreamStart(w->stream);
-
-    CFRunLoopRun();
-
-    /* Run loop stopped by CFRunLoopStop(). Now release the stream.
-     * It has already been invalidated (by watcher_close_internal). */
-    if (w->stream) {
-        FSEventStreamInvalidate(w->stream);  /* safe even if already invalidated */
         FSEventStreamRelease(w->stream);
         w->stream = NULL;
     }
-    w->run_loop = NULL;
-    return NULL;
-}
 
-/* ---- store event path (scratch buffer) -------------------------------- */
-
-static filecat_status_t store_event_path(filecat_watcher_t *w, const char *rel)
-{
-    size_t len = strlen(rel);
-    if (len + 1 > w->utf8_capacity) {
-        char *p = (char *)realloc(w->utf8_path, len + 1);
-        if (!p) return FILECAT_ERR_NO_MEMORY;
-        w->utf8_path = p;
-        w->utf8_capacity = len + 1;
+    /* Drain any callback that was already in flight on the serial queue.
+     * Once this returns, no callback can still be executing against `w`. */
+    if (w->queue) {
+        dispatch_sync_f(w->queue, NULL, noop_dispatch_fn);
     }
-    memcpy(w->utf8_path, rel, len + 1);
-    return FILECAT_OK;
+
+    /* Wake any consumer parked in pthread_cond_wait. The broadcast is done
+     * under the mutex so the standard `while (predicate) cond_wait` idiom
+     * in filecat_next_event can't miss the signal. */
+    pthread_mutex_lock(&w->mu);
+    pthread_cond_broadcast(&w->cv);
+    pthread_mutex_unlock(&w->mu);
 }
 
-/* ---- public API -------------------------------------------------------- */
+/* ---- public API ------------------------------------------------------- */
 
-filecat_status_t filecat_open(const char *path, int recursive, filecat_watcher_t **out)
+filecat_status_t filecat_open(const char *path, int recursive,
+                              filecat_watcher_t **out)
 {
     if (!path || !out) return FILECAT_ERR_INVALID_ARG;
     *out = NULL;
@@ -298,74 +337,81 @@ filecat_status_t filecat_open(const char *path, int recursive, filecat_watcher_t
     }
 
     filecat_watcher_t *w = (filecat_watcher_t *)calloc(1, sizeof(*w));
-    if (!w) {
-        free(root);
-        return FILECAT_ERR_NO_MEMORY;
-    }
+    if (!w) { free(root); return FILECAT_ERR_NO_MEMORY; }
 
-    w->root = root;
-    w->root_len = strlen(root);
+    w->root      = root;
+    w->root_len  = strlen(root);
     w->recursive = recursive ? 1 : 0;
-    atomic_init(&w->refcount, 1);
-    atomic_init(&w->closing, 0);
+    atomic_init(&w->refcount,  1);
+    atomic_init(&w->closing,   0);
     atomic_init(&w->destroyed, 0);
 
-    if (pthread_mutex_init(&w->mu, NULL) != 0 ||
-        pthread_cond_init(&w->cv, NULL) != 0) {
-        watcher_free(w);
+    if (pthread_mutex_init(&w->mu, NULL) != 0) {
+        free(w->root); free(w);
+        return FILECAT_ERR_SYSTEM;
+    }
+    if (pthread_cond_init(&w->cv, NULL) != 0) {
+        pthread_mutex_destroy(&w->mu);
+        free(w->root); free(w);
         return FILECAT_ERR_SYSTEM;
     }
 
-    /* Create FSEventStream */
-    CFStringRef pathRef = CFStringCreateWithCString(NULL, root, kCFStringEncodingUTF8);
-    if (!pathRef) {
-        watcher_free(w);
+    /* CFArray of one CFString — the path to watch. */
+    CFStringRef cf_root = CFStringCreateWithCString(NULL, w->root,
+                                                    kCFStringEncodingUTF8);
+    if (!cf_root) {
+        pthread_cond_destroy(&w->cv);
+        pthread_mutex_destroy(&w->mu);
+        free(w->root); free(w);
         return FILECAT_ERR_NO_MEMORY;
     }
-    CFArrayRef paths = CFArrayCreate(NULL, (const void **)&pathRef, 1, &kCFTypeArrayCallBacks);
-    if (!paths) {
-        CFRelease(pathRef);
-        watcher_free(w);
+    CFArrayRef paths_array = CFArrayCreate(NULL, (const void **)&cf_root, 1,
+                                           &kCFTypeArrayCallBacks);
+    CFRelease(cf_root);
+    if (!paths_array) {
+        pthread_cond_destroy(&w->cv);
+        pthread_mutex_destroy(&w->mu);
+        free(w->root); free(w);
         return FILECAT_ERR_NO_MEMORY;
     }
 
-    FSEventStreamContext ctx = {0};
-    ctx.info = w;
-    ctx.retain = NULL;
-    ctx.release = NULL;
-    ctx.copyDescription = NULL;
-
-    FSEventStreamRef stream = FSEventStreamCreate(
-        NULL,
-        fsevents_callback,
-        &ctx,
-        paths,
-        kFSEventStreamEventIdSinceNow,
-        0.0,   /* latency: 0 to get events as soon as possible */
-        kFSEventStreamCreateFlagFileEvents | kFSEventStreamCreateFlagNoDefer
-    );
-    CFRelease(paths);
-    CFRelease(pathRef);
-    if (!stream) {
-        watcher_free(w);
+    /* NoDefer: deliver the first batch with no latency window.
+     * FileEvents (10.7+): per-file granularity so we can map flags to
+     *                     CREATED / REMOVED / MODIFIED / RENAMED. */
+    FSEventStreamContext ctx = {0, w, NULL, NULL, NULL};
+    FSEventStreamCreateFlags flags = kFSEventStreamCreateFlagNoDefer
+                                   | kFSEventStreamCreateFlagFileEvents;
+    w->stream = FSEventStreamCreate(NULL, fsevents_cb, &ctx, paths_array,
+                                    kFSEventStreamEventIdSinceNow,
+                                    0.0, flags);
+    CFRelease(paths_array);
+    if (!w->stream) {
+        pthread_cond_destroy(&w->cv);
+        pthread_mutex_destroy(&w->mu);
+        free(w->root); free(w);
         return FILECAT_ERR_SYSTEM;
     }
-    w->stream = stream;
 
-    /* Spawn run-loop thread */
-    pthread_t thr;
-    if (pthread_create(&thr, NULL, run_loop_thread, w) != 0) {
-        watcher_free(w);
+    w->queue = dispatch_queue_create("com.filecat.fsevents",
+                                     DISPATCH_QUEUE_SERIAL);
+    if (!w->queue) {
+        FSEventStreamRelease(w->stream);
+        pthread_cond_destroy(&w->cv);
+        pthread_mutex_destroy(&w->mu);
+        free(w->root); free(w);
+        return FILECAT_ERR_NO_MEMORY;
+    }
+
+    FSEventStreamSetDispatchQueue(w->stream, w->queue);
+    if (!FSEventStreamStart(w->stream)) {
+        FSEventStreamInvalidate(w->stream);
+        FSEventStreamRelease(w->stream);
+        dispatch_release(w->queue);
+        pthread_cond_destroy(&w->cv);
+        pthread_mutex_destroy(&w->mu);
+        free(w->root); free(w);
         return FILECAT_ERR_SYSTEM;
     }
-    w->run_loop_thr = thr;
-
-    /* Wait for run_loop to be assigned */
-    pthread_mutex_lock(&w->mu);
-    while (w->run_loop == NULL) {
-        pthread_cond_wait(&w->cv, &w->mu);
-    }
-    pthread_mutex_unlock(&w->mu);
 
     *out = w;
     return FILECAT_OK;
@@ -374,54 +420,53 @@ filecat_status_t filecat_open(const char *path, int recursive, filecat_watcher_t
 filecat_status_t filecat_next_event(filecat_watcher_t *w, filecat_event_t *out)
 {
     if (!w || !out) return FILECAT_ERR_INVALID_ARG;
-
     watcher_retain(w);
 
-    filecat_status_t status = FILECAT_OK;
-
     pthread_mutex_lock(&w->mu);
-    if (atomic_load_explicit(&w->closing, memory_order_acquire)) {
-        pthread_mutex_unlock(&w->mu);
-        watcher_release(w);
-        return FILECAT_ERR_CLOSED;
-    }
-    while (w->head == NULL) {
-        pthread_cond_wait(&w->cv, &w->mu);
-        /* Re-check closing after spurious wake */
+    for (;;) {
         if (atomic_load_explicit(&w->closing, memory_order_acquire)) {
             pthread_mutex_unlock(&w->mu);
             watcher_release(w);
             return FILECAT_ERR_CLOSED;
         }
+        if (w->overflow_pending) {
+            w->overflow_pending = 0;
+            pthread_mutex_unlock(&w->mu);
+            watcher_release(w);
+            return FILECAT_ERR_OVERFLOW;
+        }
+        if (w->head) break;
+        pthread_cond_wait(&w->cv, &w->mu);
     }
 
-    /* Pop front node */
-    struct fc_node *node = w->head;
-    w->head = node->next;
-    if (!w->head) w->tail = NULL;
+    struct fc_node *n = w->head;
+    w->head = n->next;
+    if (w->head == NULL) w->tail = NULL;
     pthread_mutex_unlock(&w->mu);
 
-    /* Handle overflow marker */
-    if (node->type == 0 && node->rel_path == NULL) {
-        free(node);
-        watcher_release(w);
-        return FILECAT_ERR_OVERFLOW;
+    /* Materialize into the watcher-owned scratch buffer. utf8_path is
+     * touched only by the single consumer per the API contract, so we
+     * don't need the mutex here. */
+    size_t need = strlen(n->rel_path) + 1;
+    if (need > w->utf8_capacity) {
+        char *p = (char *)realloc(w->utf8_path, need);
+        if (!p) {
+            free(n->rel_path);
+            free(n);
+            watcher_release(w);
+            return FILECAT_ERR_NO_MEMORY;
+        }
+        w->utf8_path     = p;
+        w->utf8_capacity = need;
     }
+    memcpy(w->utf8_path, n->rel_path, need);
 
-    /* Store path in scratch buffer */
-    status = store_event_path(w, node->rel_path);
-    if (status != FILECAT_OK) {
-        free(node->rel_path);
-        free(node);
-        watcher_release(w);
-        return status;
-    }
-
-    out->type = node->type;
+    out->type = n->type;
     out->path = w->utf8_path;
 
-    free(node->rel_path);
-    free(node);
+    free(n->rel_path);
+    free(n);
+
     watcher_release(w);
     return FILECAT_OK;
 }
@@ -438,8 +483,7 @@ void filecat_destroy(filecat_watcher_t *w)
 {
     if (!w) return;
     int expected = 0;
-    if (!atomic_compare_exchange_strong(&w->destroyed, &expected, 1))
-        return;
+    if (!atomic_compare_exchange_strong(&w->destroyed, &expected, 1)) return;
     watcher_close_internal(w);
     watcher_release(w);   /* drop owner ref */
 }
