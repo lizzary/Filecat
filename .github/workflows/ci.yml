@@ -41,11 +41,11 @@ jobs:
             build_type: Release
           - name: windows-msvc-debug
             os: windows-latest
-            generator: Visual Studio 17 2022
+            msvc: true
             build_type: Debug
           - name: windows-msvc-release
             os: windows-latest
-            generator: Visual Studio 17 2022
+            msvc: true
             build_type: Release
 
     steps:
@@ -55,31 +55,29 @@ jobs:
         if: runner.os != 'Windows'
         run: echo "CC=${{ matrix.cc }}" >> "$GITHUB_ENV"
 
+      # Imports cl.exe/link.exe and VS-bundled headers/libs into the
+      # environment of all subsequent steps. Sidesteps CMake's vswhere-based
+      # detection (which has been flaky on the windows-2025 image).
+      - name: Set up MSVC environment
+        if: matrix.msvc
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      # Ninja is a single-config generator on every platform, so the same
+      # cmake / cmake --build / ctest commands work everywhere -- no more
+      # multi-config --config branches. The runner image preinstalls ninja.
       - name: Configure
         shell: bash
         run: |
-          if [ "${{ matrix.generator }}" = "Visual Studio 17 2022" ]; then
-            # Multi-config generator: build type is selected at build time,
-            # not at configure time.
-            cmake -B build -G "${{ matrix.generator }}" -A x64
-          else
-            cmake -B build -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
-          fi
+          cmake -B build \
+            ${{ matrix.msvc && '-G Ninja' || '' }} \
+            -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
 
       - name: Build
         shell: bash
-        run: |
-          if [ "${{ matrix.generator }}" = "Visual Studio 17 2022" ]; then
-            cmake --build build --config ${{ matrix.build_type }} -j
-          else
-            cmake --build build -j
-          fi
+        run: cmake --build build -j
 
       - name: Test
         shell: bash
-        run: |
-          if [ "${{ matrix.generator }}" = "Visual Studio 17 2022" ]; then
-            ctest --test-dir build -C ${{ matrix.build_type }} --output-on-failure
-          else
-            ctest --test-dir build --output-on-failure
-          fi
+        run: ctest --test-dir build --output-on-failure

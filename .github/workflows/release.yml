@@ -28,11 +28,19 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # ---- POSIX (Linux + macOS) -------------------------------------------
-      - name: Configure & build (POSIX)
-        if: runner.os != 'Windows'
+      # See ci.yml for the rationale: import the MSVC toolchain into the
+      # job environment so CMake doesn't need to vswhere it out.
+      - name: Set up MSVC environment
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Configure & build
+        shell: bash
         run: |
           cmake -B build \
+            ${{ runner.os == 'Windows' && '-G Ninja' || '' }} \
             -DCMAKE_BUILD_TYPE=Release \
             -DFILECAT_BUILD_TESTS=OFF
           cmake --build build -j
@@ -47,22 +55,15 @@ jobs:
           cp LICENSE README.md        staging/
           tar -czf "${{ matrix.archive }}" -C staging .
 
-      # ---- Windows (MSVC) --------------------------------------------------
-      - name: Configure & build (Windows)
-        if: runner.os == 'Windows'
-        run: |
-          cmake -B build -G "Visual Studio 17 2022" -A x64 -DFILECAT_BUILD_TESTS=OFF
-          cmake --build build --config Release -j
-
       - name: Package (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Path staging\lib, staging\bin, staging\include -Force | Out-Null
-          Copy-Item build\Release\filecat.lib        staging\lib\
-          Copy-Item build\Release\filecat-watch.exe  staging\bin\
-          Copy-Item -Recurse include\filecat         staging\include\
-          Copy-Item LICENSE, README.md               staging\
+          Copy-Item build\filecat.lib        staging\lib\
+          Copy-Item build\filecat-watch.exe  staging\bin\
+          Copy-Item -Recurse include\filecat staging\include\
+          Copy-Item LICENSE, README.md       staging\
           Compress-Archive -Path staging\* -DestinationPath "${{ matrix.archive }}"
 
       - name: Upload artifact
