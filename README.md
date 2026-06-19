@@ -1,5 +1,10 @@
 # Filecat
 
+[![CI](https://github.com/lizzary/Filecat/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/lizzary/Filecat/actions/workflows/ci.yml)
+[![Sanitizers](https://github.com/lizzary/Filecat/actions/workflows/sanitize.yml/badge.svg?branch=main)](https://github.com/lizzary/Filecat/actions/workflows/sanitize.yml)
+[![Release](https://github.com/lizzary/Filecat/actions/workflows/release.yml/badge.svg)](https://github.com/lizzary/Filecat/actions/workflows/release.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 A small cross-platform C library for watching directories and emitting raw
 filesystem events (created, removed, modified, renamed) from the underlying
 OS APIs.
