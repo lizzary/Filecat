@@ -106,13 +106,14 @@ static filecat_event_type_t map_flags(FSEventStreamEventFlags f)
         return FILECAT_EVENT_RENAMED_OLD;
     }
     if (f & kFSEventStreamEventFlagItemRemoved) return FILECAT_EVENT_REMOVED;
-    if (f & kFSEventStreamEventFlagItemCreated) return FILECAT_EVENT_CREATED;
     if (f & ( kFSEventStreamEventFlagItemModified
             | kFSEventStreamEventFlagItemInodeMetaMod
             | kFSEventStreamEventFlagItemXattrMod
             | kFSEventStreamEventFlagItemFinderInfoMod
             | kFSEventStreamEventFlagItemChangeOwner))
         return FILECAT_EVENT_MODIFIED;
+    if (f & kFSEventStreamEventFlagItemCreated) return FILECAT_EVENT_CREATED;
+
     return FILECAT_EVENT_MODIFIED;
 }
 
