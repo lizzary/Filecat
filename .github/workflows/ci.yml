@@ -1,0 +1,85 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# A new push to the same branch cancels in-flight runs for that branch.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-gcc-debug
+            os: ubuntu-latest
+            cc: gcc
+            build_type: Debug
+          - name: linux-gcc-release
+            os: ubuntu-latest
+            cc: gcc
+            build_type: Release
+          - name: linux-clang-release
+            os: ubuntu-latest
+            cc: clang
+            build_type: Release
+          - name: macos-clang-debug
+            os: macos-latest
+            cc: clang
+            build_type: Debug
+          - name: macos-clang-release
+            os: macos-latest
+            cc: clang
+            build_type: Release
+          - name: windows-msvc-debug
+            os: windows-latest
+            generator: Visual Studio 17 2022
+            build_type: Debug
+          - name: windows-msvc-release
+            os: windows-latest
+            generator: Visual Studio 17 2022
+            build_type: Release
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Select compiler (POSIX)
+        if: runner.os != 'Windows'
+        run: echo "CC=${{ matrix.cc }}" >> "$GITHUB_ENV"
+
+      - name: Configure
+        shell: bash
+        run: |
+          if [ "${{ matrix.generator }}" = "Visual Studio 17 2022" ]; then
+            # Multi-config generator: build type is selected at build time,
+            # not at configure time.
+            cmake -B build -G "${{ matrix.generator }}" -A x64
+          else
+            cmake -B build -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
+          fi
+
+      - name: Build
+        shell: bash
+        run: |
+          if [ "${{ matrix.generator }}" = "Visual Studio 17 2022" ]; then
+            cmake --build build --config ${{ matrix.build_type }} -j
+          else
+            cmake --build build -j
+          fi
+
+      - name: Test
+        shell: bash
+        run: |
+          if [ "${{ matrix.generator }}" = "Visual Studio 17 2022" ]; then
+            ctest --test-dir build -C ${{ matrix.build_type }} --output-on-failure
+          else
+            ctest --test-dir build --output-on-failure
+          fi
