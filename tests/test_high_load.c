@@ -89,10 +89,20 @@ static int test_high_load_n_producers(void)
     /* (1) No internal errors. */
     TH_ASSERT_EQ(col.errors, 0);
     /* (2) Either we observed close to all events, or the kernel
-     *     signalled overflow. Both are correct outcomes. The combined
-     *     CREATED+REMOVED count absorbs FSEvents coalescing on macOS. */
+     *     signalled overflow. Both are correct outcomes.
+     *
+     *     The producer issues touch+unlink on the same path, so the
+     *     fundamental unit of work is the PAIR, not the individual op.
+     *     On macOS FSEvents coalesces a tightly-spaced create+delete on
+     *     the same path into a single batched event (classified as
+     *     REMOVED, since Removed outranks Created in map_flags), so the
+     *     hard upper bound on observable events is the pair count, not
+     *     2× it. Comparing against the pair count keeps the assertion
+     *     meaningful on Linux/Windows (which don't coalesce) while
+     *     being reachable on macOS. */
+    int pair_count = (total_created < total_removed) ? total_created : total_removed;
     TH_ASSERT(col.overflows > 0
-              || obs_c + obs_r >= (total_created + total_removed) * 3 / 4);
+              || obs_c + obs_r >= pair_count * 3 / 4);
     /* (3) Watcher survives — destroy must complete without crashing. */
 
     th_collector_free(&col);
