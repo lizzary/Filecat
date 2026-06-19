@@ -143,8 +143,10 @@
 
 #define TH_ASSERT_OK(expr) TH_ASSERT_STATUS((expr), FILECAT_OK)
 
-static int th_passes = 0;
-static int th_fails  = 0;
+/* TH_UNUSED on the counters so bench programs can include this header
+ * without unused-variable warnings (they don't use TH_RUN/TH_SUMMARY). */
+static int th_passes TH_UNUSED = 0;
+static int th_fails  TH_UNUSED = 0;
 
 /* ============================================================== */
 /* Time                                                            */

@@ -85,3 +85,40 @@ if(FILECAT_BUILD_TESTS)
     set_tests_properties(test_stress      PROPERTIES TIMEOUT 60)
     set_tests_properties(test_high_load   PROPERTIES TIMEOUT 90)
 endif()
+
+# Benchmarks are opt-in: they're for manual perf runs and CI dashboards,
+# not the default build, and they share Threads with the tests.
+option(FILECAT_BUILD_BENCH "Build benchmark programs" OFF)
+if(FILECAT_BUILD_BENCH)
+    if(NOT TARGET Threads::Threads)
+        set(CMAKE_THREAD_PREFER_PTHREAD TRUE)
+        set(THREADS_PREFER_PTHREAD_FLAG TRUE)
+        find_package(Threads REQUIRED)
+    endif()
+
+    set(_FILECAT_BENCHES
+        bench_throughput
+        bench_latency
+        bench_rss
+        bench_open)
+
+    foreach(_b IN LISTS _FILECAT_BENCHES)
+        add_executable(${_b} bench/${_b}.c)
+        target_link_libraries(${_b} PRIVATE filecat Threads::Threads)
+        target_include_directories(${_b} PRIVATE bench tests)
+        if(MSVC)
+            target_compile_options(${_b} PRIVATE /W3)
+            target_compile_definitions(${_b} PRIVATE
+                _CRT_SECURE_NO_WARNINGS
+                _CRT_NONSTDC_NO_DEPRECATE)
+            # GetProcessMemoryInfo lives in psapi.lib (since Windows 7,
+            # it's just an alias for kernel32 -- linking is still required).
+            target_link_libraries(${_b} PRIVATE psapi)
+        else()
+            target_compile_options(${_b} PRIVATE -Wall -Wextra)
+            if(CMAKE_C_COMPILER_ID STREQUAL "GNU")
+                target_compile_options(${_b} PRIVATE -Wno-format-truncation)
+            endif()
+        endif()
+    endforeach()
+endif()

@@ -176,6 +176,40 @@ CTest enforces per-suite timeouts (30 s / 60 s / 90 s, see
 [CMakeLists.txt](CMakeLists.txt)) and will kill a hung run rather than
 let CI stall.
 
+## Benchmarks
+
+Four reproducible micro-benchmarks live in [bench/](bench/), built only
+when explicitly requested (off by default):
+
+```bash
+cmake -B build -DCMAKE_BUILD_TYPE=Release -DFILECAT_BUILD_BENCH=ON
+cmake --build build -j
+bench/run.sh                        # or invoke the binaries individually
+```
+
+| Binary             | What it measures                                                                  |
+|--------------------|-----------------------------------------------------------------------------------|
+| `bench_throughput` | events drained per second under 4 producer threads × 10 s sustained load          |
+| `bench_latency`    | end-to-end touch → event latency over 5000 samples, min/p50/p90/p99/p999/max      |
+| `bench_rss`        | resident set size delta when opening a recursive watcher over N subdirectories    |
+| `bench_open`       | `filecat_open` cold-start time vs subtree size (median of 3 trials)               |
+
+A few notes before publishing numbers:
+
+- `bench_rss` and `bench_open` are designed to expose platform asymmetry:
+  Linux registers one inotify watch per directory (O(N) memory and time),
+  while Windows/macOS use a single handle/stream (O(1)). The headline
+  story here is *shape*, not absolute KB or ms.
+- Latency p99 is sensitive to scheduler noise. For publishable numbers,
+  pin the binary (`taskset -c 0` on Linux), disable Turbo Boost, and
+  build with `-DCMAKE_BUILD_TYPE=Release` (never with sanitizers on).
+- On Linux, `bench_rss` and `bench_open` honor `fs.inotify.max_user_watches`;
+  the backend is best-effort, so values above the cap will print but won't
+  reflect a fully-watched tree.
+
+> _Headline numbers and comparison runs (vs fswatch and raw inotify/RDCW)
+> will land under `bench/results/` after a documented hardware baseline._
+
 ## Demo
 
 `filecat-watch` is a 70-line CLI built from
