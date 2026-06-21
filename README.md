@@ -5,12 +5,31 @@
 [![Release](https://github.com/lizzary/Filecat/actions/workflows/release.yml/badge.svg)](https://github.com/lizzary/Filecat/actions/workflows/release.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-A small cross-platform C library for watching directories and emitting raw
-filesystem events (created, removed, modified, renamed) from the underlying
-OS APIs.
+A cross-platform C library for **recursive directory watching**, designed to
+be embedded into higher-level runtimes via FFI/cgo.
 
-The C library is designed to be wrapped as a Go module via cgo (see
-`bindings/go/`, planned).
+## Why Filecat
+
+Go's [`fsnotify`](https://github.com/fsnotify/fsnotify) does not support
+recursive watching: inotify is non-recursive, so any "watch a whole tree"
+abstraction written in pure Go has to walk the tree and register one watch
+per directory in user space. On a large source tree (a monorepo, a
+`node_modules`, a build cache) this routinely costs **gigabytes of RSS** and
+**tens of seconds of cold-start time** before the first event can be
+delivered — long enough that the tree has already changed under you.
+
+Filecat pushes recursion down to each platform's native subsystem
+(`inotify` / `ReadDirectoryChangesW` / `FSEvents`) behind a single C ABI,
+so callers get `(type, path)` events without managing a recursive walker
+or a per-directory watch table themselves.
+
+A reference cgo binding lives under [`bindings/go/`](bindings/go/); a
+higher-level Go module (`filecat-go`, separate repo) is planned on top of
+it.
+
+For the rationale behind the public API shape, the rename-event unification,
+and the per-platform memory/latency trade-offs, see
+[`docs/DESIGN.md`](docs/DESIGN.md).
 
 ## Status
 
