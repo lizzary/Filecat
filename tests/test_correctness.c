@@ -32,6 +32,17 @@ static void *th_blocking_next_(void *arg)
     return NULL;
 }
 
+struct th_two_touch_arg { const char *p1, *p2; int initial_delay_ms; };
+static void *th_two_touch_(void *arg)
+{
+    struct th_two_touch_arg *a = (struct th_two_touch_arg *)arg;
+    th_sleep_ms(a->initial_delay_ms);
+    th_touch(a->p1);
+    th_sleep_ms(50);
+    th_touch(a->p2);
+    return NULL;
+}
+
 /* =============================================================== */
 
 static int test_strerror_all_codes(void)
@@ -399,6 +410,326 @@ static int test_two_watchers_in_one_dir(void)
     return 0;
 }
 
+/* ============================================================== */
+/* Strict API-contract tests                                       */
+/* ============================================================== */
+
+/* The typical shutdown sequence: close signals stop, then destroy drops
+ * the owner ref. After close, next_event must report CLOSED; destroy
+ * must then absorb the already-closed handle without double-free. */
+static int test_close_then_destroy(void)
+{
+    char *dir = th_mktmp(); TH_ASSERT(dir);
+    filecat_watcher_t *w;
+    TH_ASSERT_OK(filecat_open(dir, 0, &w));
+    filecat_close(w);
+
+    filecat_event_t ev;
+    TH_ASSERT_STATUS(filecat_next_event(w, &ev), FILECAT_ERR_CLOSED);
+
+    filecat_destroy(w);
+    th_rmtree(dir); free(dir);
+    return 0;
+}
+
+/* destroy without a prior close: the close-handle fallback inside
+ * watcher_close_handle must still release the directory handle so the
+ * subsequent rmtree on Windows isn't blocked. */
+static int test_destroy_without_close(void)
+{
+    char *dir = th_mktmp(); TH_ASSERT(dir);
+    filecat_watcher_t *w;
+    TH_ASSERT_OK(filecat_open(dir, 0, &w));
+    filecat_destroy(w);
+
+    th_rmtree(dir);
+    /* If destroy leaked the handle, on Windows the directory would still
+     * exist (RemoveDirectory would have failed silently inside rmtree). */
+#ifdef _WIN32
+    DWORD a = GetFileAttributesA(dir);
+    TH_ASSERT(a == INVALID_FILE_ATTRIBUTES);
+#else
+    struct stat st;
+    TH_ASSERT(stat(dir, &st) != 0);
+#endif
+    free(dir);
+    return 0;
+}
+
+/* CLOSED is sticky: once close has been signalled, every subsequent
+ * next_event must keep returning CLOSED without ever blocking. Validates
+ * the `closing` latch fast-path at the top of filecat_next_event. */
+static int test_next_event_after_close_returns_closed_repeatedly(void)
+{
+    char *dir = th_mktmp(); TH_ASSERT(dir);
+    filecat_watcher_t *w;
+    TH_ASSERT_OK(filecat_open(dir, 0, &w));
+    filecat_close(w);
+
+    filecat_event_t ev;
+    for (int i = 0; i < 32; i++) {
+        filecat_status_t s = filecat_next_event(w, &ev);
+        if (s != FILECAT_ERR_CLOSED)
+            TH_FAIL("iteration %d: got %s, want closed",
+                    i, filecat_strerror(s));
+    }
+
+    filecat_destroy(w);
+    th_rmtree(dir); free(dir);
+    return 0;
+}
+
+/* filecat.h promises event.path is "relative to the watch root in the
+ * OS's native separator form" — so no leading separator, no absolute
+ * prefix, no drive letter. */
+static int test_event_path_is_relative(void)
+{
+    char *dir = th_mktmp(); TH_ASSERT(dir);
+    filecat_watcher_t *w;
+    TH_ASSERT_OK(filecat_open(dir, 0, &w));
+    th_collector_t col;
+    TH_ASSERT_EQ(th_collector_start(&col, w), 0);
+
+    char path[1024];
+    snprintf(path, sizeof(path), "%s" TH_SEP "leaf.txt", dir);
+    TH_ASSERT_EQ(th_touch(path), 0);
+    th_sleep_ms(TH_SETTLE_MS);
+    th_collector_stop(&col);
+
+    int saw_leaf = 0;
+    th_mutex_lock(&col.mu);
+    for (int i = 0; i < col.n; i++) {
+        const char *p = col.events[i].path;
+        TH_ASSERT(p != NULL);
+        TH_ASSERT(p[0] != TH_SEP_CHAR);
+        TH_ASSERT(strstr(p, dir) == NULL);
+#ifdef _WIN32
+        /* A relative path never begins with "X:". */
+        TH_ASSERT(!(p[0] && p[1] == ':'));
+#endif
+        if (strcmp(p, "leaf.txt") == 0) saw_leaf = 1;
+    }
+    th_mutex_unlock(&col.mu);
+    TH_ASSERT(saw_leaf);
+
+    th_collector_free(&col);
+    filecat_destroy(w);
+    th_rmtree(dir); free(dir);
+    return 0;
+}
+
+/* Header contract: event.path is "valid only until the next
+ * filecat_next_event / filecat_close call". This test drives two events
+ * synchronously and duplicates the FIRST event's path *before* issuing
+ * the second call — the library must not have corrupted that buffer
+ * between the two calls. */
+static int test_event_path_lifetime(void)
+{
+    char *dir = th_mktmp(); TH_ASSERT(dir);
+    char p1[1024], p2[1024];
+    snprintf(p1, sizeof(p1), "%s" TH_SEP "first.txt",  dir);
+    snprintf(p2, sizeof(p2), "%s" TH_SEP "second.txt", dir);
+
+    filecat_watcher_t *w;
+    TH_ASSERT_OK(filecat_open(dir, 0, &w));
+
+    /* Producer fires both touches after a delay long enough for the
+     * consumer (this thread) to park inside next_event — on Windows
+     * RDCW has to be armed before the touch arrives. */
+    struct th_two_touch_arg pa = { p1, p2, 150 };
+    th_thread_t prod;
+    TH_ASSERT_EQ(th_thread_create(&prod, th_two_touch_, &pa), 0);
+
+    filecat_event_t ev1;
+    TH_ASSERT_OK(filecat_next_event(w, &ev1));
+    TH_ASSERT(ev1.path != NULL);
+    size_t len1 = strlen(ev1.path);
+    TH_ASSERT(len1 > 0 && len1 < 1024);
+    char *dup1 = (char *)malloc(len1 + 1);
+    TH_ASSERT(dup1);
+    memcpy(dup1, ev1.path, len1 + 1);
+
+    /* Second call may invalidate ev1.path, but dup1 must survive. */
+    filecat_event_t ev2;
+    TH_ASSERT_OK(filecat_next_event(w, &ev2));
+    TH_ASSERT(ev2.path != NULL);
+
+    th_thread_join(prod);
+
+    /* dup1 still readable and well-formed after the second call. */
+    TH_ASSERT(strcmp(dup1, "first.txt")  == 0 ||
+              strcmp(dup1, "second.txt") == 0);
+
+    free(dup1);
+    filecat_destroy(w);
+    th_rmtree(dir); free(dir);
+    return 0;
+}
+
+/* Opening with a trailing path separator must be tolerated: on Windows
+ * GetFullPathNameW normalizes it away; on POSIX a trailing slash on a
+ * directory is always valid. */
+static int test_open_with_trailing_separator(void)
+{
+    char *dir = th_mktmp(); TH_ASSERT(dir);
+    char sub[1024], subSlash[1024], file[1024];
+    snprintf(sub,      sizeof(sub),      "%s" TH_SEP "sub", dir);
+    TH_ASSERT_EQ(th_mkdir(sub), 0);
+    snprintf(subSlash, sizeof(subSlash), "%s" TH_SEP "sub" TH_SEP, dir);
+    snprintf(file,     sizeof(file),     "%s" TH_SEP "x.txt", sub);
+
+    filecat_watcher_t *w;
+    TH_ASSERT_OK(filecat_open(subSlash, 0, &w));
+    th_collector_t col;
+    TH_ASSERT_EQ(th_collector_start(&col, w), 0);
+
+    TH_ASSERT_EQ(th_touch(file), 0);
+    th_sleep_ms(TH_SETTLE_MS);
+    th_collector_stop(&col);
+
+    TH_ASSERT(th_collector_contains(&col, FILECAT_EVENT_CREATED, "x.txt"));
+
+    th_collector_free(&col);
+    filecat_destroy(w);
+    th_rmtree(dir); free(dir);
+    return 0;
+}
+
+/* mkdir/rmdir on a subdirectory must produce CREATED / REMOVED at the
+ * parent. Validates that the directory-name filter is in the watch mask
+ * (Windows: FILE_NOTIFY_CHANGE_DIR_NAME; Linux: IN_CREATE/IN_DELETE on
+ * subdirectory entries). */
+static int test_directory_create_remove_events(void)
+{
+    char *dir = th_mktmp(); TH_ASSERT(dir);
+    filecat_watcher_t *w;
+    TH_ASSERT_OK(filecat_open(dir, 0, &w));
+    th_collector_t col;
+    TH_ASSERT_EQ(th_collector_start(&col, w), 0);
+
+    char sub[1024];
+    snprintf(sub, sizeof(sub), "%s" TH_SEP "newdir", dir);
+    TH_ASSERT_EQ(th_mkdir(sub), 0);
+    th_sleep_ms(TH_SETTLE_MS);
+    TH_ASSERT_EQ(th_rmdir(sub), 0);
+    th_sleep_ms(TH_SETTLE_MS);
+    th_collector_stop(&col);
+
+    TH_ASSERT(th_collector_contains(&col, FILECAT_EVENT_CREATED, "newdir"));
+    TH_ASSERT(th_collector_contains(&col, FILECAT_EVENT_REMOVED, "newdir"));
+    TH_ASSERT_EQ(col.errors, 0);
+
+    th_collector_free(&col);
+    filecat_destroy(w);
+    th_rmtree(dir); free(dir);
+    return 0;
+}
+
+/* The watch mask includes attribute changes — toggling read-only must
+ * surface as MODIFIED. Validates FILE_NOTIFY_CHANGE_ATTRIBUTES (Windows)
+ * and IN_ATTRIB -> MODIFIED mapping (Linux). */
+static int test_attribute_change_event(void)
+{
+    char *dir = th_mktmp(); TH_ASSERT(dir);
+    char path[1024];
+    snprintf(path, sizeof(path), "%s" TH_SEP "attr.txt", dir);
+    TH_ASSERT_EQ(th_touch(path), 0);
+
+    filecat_watcher_t *w;
+    TH_ASSERT_OK(filecat_open(dir, 0, &w));
+    th_collector_t col;
+    TH_ASSERT_EQ(th_collector_start(&col, w), 0);
+
+    TH_ASSERT_EQ(th_set_readonly(path), 0);
+    th_sleep_ms(TH_SETTLE_MS);
+    th_collector_stop(&col);
+
+    TH_ASSERT(th_collector_contains(&col, FILECAT_EVENT_MODIFIED, "attr.txt"));
+    TH_ASSERT_EQ(col.errors, 0);
+
+    /* Clear before rmtree so unlink can succeed. */
+    th_clear_readonly(path);
+    th_collector_free(&col);
+    filecat_destroy(w);
+    th_rmtree(dir); free(dir);
+    return 0;
+}
+
+/* Spaces in the watched directory path must work end-to-end. Easy to
+ * miss when CreateFileW / GetFullPathNameW are involved — earlier
+ * Win32 wrappers used to require quoting. */
+static int test_path_with_spaces(void)
+{
+    char *dir = th_mktmp(); TH_ASSERT(dir);
+    char sub[1024], file[1024];
+    snprintf(sub,  sizeof(sub),  "%s" TH_SEP "with space dir", dir);
+    TH_ASSERT_EQ(th_mkdir(sub), 0);
+    snprintf(file, sizeof(file), "%s" TH_SEP "leaf.txt", sub);
+
+    filecat_watcher_t *w;
+    TH_ASSERT_OK(filecat_open(sub, 0, &w));
+    th_collector_t col;
+    TH_ASSERT_EQ(th_collector_start(&col, w), 0);
+
+    TH_ASSERT_EQ(th_touch(file), 0);
+    th_sleep_ms(TH_SETTLE_MS);
+    th_collector_stop(&col);
+
+    TH_ASSERT(th_collector_contains(&col, FILECAT_EVENT_CREATED, "leaf.txt"));
+
+    th_collector_free(&col);
+    filecat_destroy(w);
+    th_rmtree(dir); free(dir);
+    return 0;
+}
+
+/* UTF-8 contract: the header says event.path is UTF-8. Create a file
+ * with a non-ASCII name and assert the emitted path bytes match exactly
+ * — exercises the UTF-16 -> UTF-8 round trip in the Windows backend
+ * (store_event_path) and the raw byte passthrough on POSIX. */
+static int test_unicode_filename_event(void)
+{
+    char *dir = th_mktmp(); TH_ASSERT(dir);
+    /* "测试.txt" in UTF-8 bytes. */
+    const char *u8name = "\xe6\xb5\x8b\xe8\xaf\x95.txt";
+    char path[1024];
+    snprintf(path, sizeof(path), "%s" TH_SEP "%s", dir, u8name);
+
+    filecat_watcher_t *w;
+    TH_ASSERT_OK(filecat_open(dir, 0, &w));
+    th_collector_t col;
+    TH_ASSERT_EQ(th_collector_start(&col, w), 0);
+
+    TH_ASSERT_EQ(th_touch_u8(path), 0);
+    th_sleep_ms(TH_SETTLE_MS);
+    th_collector_stop(&col);
+
+    TH_ASSERT(th_collector_contains(&col, FILECAT_EVENT_CREATED, u8name));
+    TH_ASSERT_EQ(col.errors, 0);
+
+    th_collector_free(&col);
+    filecat_destroy(w);
+    th_rmtree(dir); free(dir);
+    return 0;
+}
+
+/* Re-opening the same directory after destroy must succeed repeatedly.
+ * If destroy leaked the handle, on Windows this would still appear to
+ * work (we open with SHARE_READ|WRITE|DELETE) but the handle count would
+ * climb; on POSIX the inotify_fd would leak. Either way, 16 iterations
+ * is enough to flush out a use-after-free in the shutdown path. */
+static int test_open_destroy_repeated_same_dir(void)
+{
+    char *dir = th_mktmp(); TH_ASSERT(dir);
+    for (int i = 0; i < 16; i++) {
+        filecat_watcher_t *w;
+        TH_ASSERT_OK(filecat_open(dir, 0, &w));
+        filecat_destroy(w);
+    }
+    th_rmtree(dir); free(dir);
+    return 0;
+}
+
 int main(void)
 {
     TH_RUN(test_strerror_all_codes);
@@ -414,5 +745,17 @@ int main(void)
     TH_RUN(test_close_from_another_thread_unblocks);
     TH_RUN(test_destroy_from_another_thread_unblocks);
     TH_RUN(test_two_watchers_in_one_dir);
+    /* strict API-contract tests */
+    TH_RUN(test_close_then_destroy);
+    TH_RUN(test_destroy_without_close);
+    TH_RUN(test_next_event_after_close_returns_closed_repeatedly);
+    TH_RUN(test_event_path_is_relative);
+    TH_RUN(test_event_path_lifetime);
+    TH_RUN(test_open_with_trailing_separator);
+    TH_RUN(test_directory_create_remove_events);
+    TH_RUN(test_attribute_change_event);
+    TH_RUN(test_path_with_spaces);
+    TH_RUN(test_unicode_filename_event);
+    TH_RUN(test_open_destroy_repeated_same_dir);
     TH_SUMMARY();
 }

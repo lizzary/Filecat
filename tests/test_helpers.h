@@ -249,6 +249,66 @@ static int th_write(const char *path, const char *content)
     return fclose(f) == 0 ? 0 : -1;
 }
 
+static int th_rmdir(const char *path) TH_UNUSED;
+static int th_rmdir(const char *path)
+{
+#ifdef _WIN32
+    return _rmdir(path);
+#else
+    return rmdir(path);
+#endif
+}
+
+/* Toggle a "modify the attributes" event without changing file contents.
+ * On Windows this sets the read-only attribute, which triggers
+ * FILE_NOTIFY_CHANGE_ATTRIBUTES; on POSIX it chmods. Pair with
+ * th_clear_readonly so subsequent cleanup (th_rmtree / unlink) succeeds. */
+static int th_set_readonly(const char *path) TH_UNUSED;
+static int th_set_readonly(const char *path)
+{
+#ifdef _WIN32
+    return SetFileAttributesA(path, FILE_ATTRIBUTE_READONLY) ? 0 : -1;
+#else
+    return chmod(path, 0444);
+#endif
+}
+
+static int th_clear_readonly(const char *path) TH_UNUSED;
+static int th_clear_readonly(const char *path)
+{
+#ifdef _WIN32
+    return SetFileAttributesA(path, FILE_ATTRIBUTE_NORMAL) ? 0 : -1;
+#else
+    return chmod(path, 0644);
+#endif
+}
+
+/* UTF-8 safe touch. On Windows, fopen() interprets its path argument as
+ * the current ANSI codepage, which mangles non-ASCII bytes — we convert
+ * to UTF-16 and use _wfopen instead. On POSIX paths are opaque byte
+ * sequences, so plain fopen on UTF-8 just works. */
+static int th_touch_u8(const char *utf8_path) TH_UNUSED;
+static int th_touch_u8(const char *utf8_path)
+{
+#ifdef _WIN32
+    int wlen = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS,
+                                   utf8_path, -1, NULL, 0);
+    if (wlen <= 0) return -1;
+    wchar_t *w = (wchar_t *)malloc(sizeof(wchar_t) * (size_t)wlen);
+    if (!w) return -1;
+    if (MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS,
+                            utf8_path, -1, w, wlen) <= 0) {
+        free(w); return -1;
+    }
+    FILE *f = _wfopen(w, L"wb");
+    free(w);
+    if (!f) return -1;
+    return fclose(f) == 0 ? 0 : -1;
+#else
+    return th_touch(utf8_path);
+#endif
+}
+
 /* Build a unique temporary directory and return its absolute path. The
  * caller free()s the result and is responsible for th_rmtree before
  * release. */
