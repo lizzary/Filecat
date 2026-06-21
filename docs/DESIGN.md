@@ -92,8 +92,8 @@ categories of return value from `filecat_next_event`:
 | Category    | Example                | Caller action                                    |
 | ----------- | ---------------------- | ------------------------------------------------ |
 | Success     | `FILECAT_OK`           | Consume `ev`, call again.                        |
-| Recoverable | `FILECAT_OVERFLOW`     | Lost events; rescan the tree, then call again.   |
-| Fatal       | `FILECAT_E_CLOSED`, … | Stop. The watcher is no longer usable.           |
+| Recoverable | `FILECAT_ERR_OVERFLOW`     | Lost events; rescan the tree, then call again.   |
+| Fatal       | `FILECAT_ERR_CLOSED`, … | Stop. The watcher is no longer usable.           |
 
 Recoverable statuses are first-class so that the caller can distinguish
 "the OS queue overflowed; reconcile" from "this watcher is dead". On
@@ -135,6 +135,15 @@ is best-effort: it stops adding new watches when the limit is hit but does
 not fail `filecat_open`. The caller can detect partial coverage by checking
 `bench_rss` / `bench_open` against the directory count.
 
+The watched directory itself does not produce events: inotify SELF
+events (`IN_DELETE_SELF`, `IN_MOVE_SELF`, root-level `IN_ATTRIB`) are
+silently dropped. This mirrors `ReadDirectoryChangesW` on Windows, which
+never reports changes to the watch root. Callers that need to know
+when the root disappears should watch the parent directory.
+
+Known limitation: a small window of events with stale paths may slip
+out between the actual rename and our processing of IN_MOVED_FROM.
+
 ### 3.2 Windows — `ReadDirectoryChangesW`
 
 A single `CreateFileW` with `FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OVERLAPPED`
@@ -170,19 +179,38 @@ that the caller is already prepared to drain in a tight loop.
 
 ## 4. Rename semantics
 
-Renames are the place where each platform exposes its internals most
-loudly. Filecat's job is to present one event type — `FILECAT_EVENT_RENAMED`
-— with both `old_path` and `new_path` populated whenever it can, and to
-fall back to a `REMOVED` + `CREATED` pair when it cannot.
+Rename is the place where the three OSes diverge most loudly, and Filecat
+does **not** try to paper that over inside the library. Pairing OLD with
+NEW would require either a Linux-style move cookie that doesn't exist on
+macOS, or inode-tracking heuristics that lie under load. Instead the
+library surfaces what each backend can prove and lets the caller (or a
+higher-level binding such as `filecat-go`) reconcile.
 
-| Platform | Native shape                                                                                                            | Pairing strategy                                                                  |
-| -------- | ----------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------- |
-| Linux    | Two events: `IN_MOVED_FROM` and `IN_MOVED_TO`, tied by a shared `cookie`. Either may appear without the other.          | The backend buffers `IN_MOVED_FROM` keyed by cookie for a short window; if `IN_MOVED_TO` arrives, emit one paired RENAMED; if it doesn't, flush as REMOVED. A bare `IN_MOVED_TO` is emitted as CREATED. |
-| Windows  | Two records in the same `ReadDirectoryChangesW` buffer: `FILE_ACTION_RENAMED_OLD_NAME` immediately followed by `FILE_ACTION_RENAMED_NEW_NAME`. | Always paired (per MSDN guarantee). Emit one RENAMED.                              |
-| macOS    | A single event with `kFSEventStreamEventFlagItemRenamed`; the same flag fires on both the old and new path.             | Inode-based pairing: the backend checks `stat`/`lstat` on the reported path to determine which side of the rename it is, and pairs by inode when possible. Cross-volume renames degrade to REMOVED + CREATED. |
+| Platform | Native shape | Filecat surface |
+| -------- | ------------ | --------------- |
+| Linux    | `IN_MOVED_FROM` (with a `cookie`) followed by `IN_MOVED_TO` (same cookie). Either may appear alone when the move crosses the watch boundary. | Two events emitted in order: `FILECAT_EVENT_RENAMED_OLD` for the FROM side, `FILECAT_EVENT_RENAMED_NEW` for the TO side. The cookie is **not** exposed — callers that need pairing rely on adjacency in the event stream. A half-move (FROM or TO without its mate) is emitted as just that one event. |
+| Windows  | `FILE_ACTION_RENAMED_OLD_NAME` immediately followed by `FILE_ACTION_RENAMED_NEW_NAME` in the same `ReadDirectoryChangesW` buffer (MSDN-guaranteed adjacency). | Same surface as Linux: `FILECAT_EVENT_RENAMED_OLD` then `FILECAT_EVENT_RENAMED_NEW`. Adjacency is structurally guaranteed by the OS. |
+| macOS    | `kFSEventStreamEventFlagItemRenamed` fires on **each** side of the rename, with no shared identifier and no guaranteed adjacency. The flag alone carries no "this is the old side" / "this is the new side" information. | The FSEvents backend can only emit `FILECAT_EVENT_RENAMED_OLD` — once per side. A single rename therefore appears as **two `RENAMED_OLD` events** whose adjacency is best-effort, never guaranteed by the OS. There is no `FILECAT_EVENT_RENAMED_NEW` on macOS. |
 
-The unified contract means binding authors do not have to re-implement
-cookie tracking or inode pairing in every language.
+**Implication for binding authors.** Cross-platform pairing logic does
+*not* belong in the C library; it belongs one layer up, where you also
+have a binding-language string type to hold the paired result. The recommended pattern is:
+
+- Linux / Windows: pair `RENAMED_OLD` with the immediately following
+  `RENAMED_NEW`. If the next event is not `RENAMED_NEW`, treat the
+  `RENAMED_OLD` as an unpaired half-move (the target left the watched
+  subtree).
+- macOS: treat every `RENAMED_OLD` as "this path may have just changed
+  identity; re-`stat` if you care." Two adjacent `RENAMED_OLD` events
+  with a parent/sibling relationship are *probably* the two sides of one
+  rename, but the library makes no such promise and neither should the
+  binding.
+
+This asymmetry is the single most common source of "why does my watcher
+behave differently on Mac" bugs in this category of library. Naming the
+events `RENAMED_OLD` / `RENAMED_NEW` (instead of a single `RENAMED`)
+makes the asymmetry explicit at the API surface rather than hiding it
+behind a leaky abstraction.
 
 ## 5. Platform-specific notes
 
@@ -230,27 +258,86 @@ per-event delivery.
 
 ## 6. Threading model
 
-Internally:
+### 6.1 Where each backend blocks
 
-- **Linux** runs `filecat_next_event` on the caller's thread. It blocks in
-  `read(2)` on the inotify fd with `IN_NONBLOCK` cleared via `poll(2)`.
-- **Windows** runs an IO completion port owned by the caller's thread.
-  `GetQueuedCompletionStatus` is the blocking point.
-- **macOS** runs FSEvents on a private CFRunLoop thread that pushes onto
-  an SPSC queue; `filecat_next_event` blocks on a condition variable
-  attached to that queue.
+- **Linux** ([`src/platform/linux/filecat_linux.c`](../src/platform/linux/filecat_linux.c)).
+  The inotify fd is opened with `IN_CLOEXEC` only (blocking). The watcher
+  also owns an `eventfd(0, EFD_CLOEXEC)` used purely as a cancel channel.
+  `filecat_next_event` parks the caller's thread in `poll(2)` on both
+  fds with timeout `-1`. `read(2)` on the inotify fd only runs after
+  `POLLIN` fires on it; `POLLIN` on the eventfd, or `POLLERR|POLLHUP|POLLNVAL`
+  on either, is translated to `FILECAT_ERR_CLOSED`.
+- **Windows.** An IO completion port owned by the watcher. `GetQueuedCompletionStatus`
+  is the blocking point. Cancellation is a sentinel completion posted
+  by `filecat_close`. Semantics mirror Linux.
+- **macOS.** FSEvents runs on a private `CFRunLoop` thread that pushes
+  onto an internal SPSC queue. `filecat_next_event` blocks on a condition
+  variable attached to that queue; `filecat_close` signals the cvar and
+  tears down the run loop.
 
-The public contract is: **one thread calls `filecat_next_event` on a
-watcher.** Calling it from two threads concurrently on the same watcher
-is undefined behavior. Different watchers are fully independent and may
-be driven from different threads.
+### 6.2 Lifecycle: refcount + two latches
 
-`filecat_close` is safe to call from any thread *if and only if* no
-`filecat_next_event` call is in progress on that watcher. Closers that
-want to interrupt an in-flight blocking call should signal the worker
-thread out-of-band first (e.g. a Go context cancellation that closes the
-channel; the binding then awaits the worker's exit before calling
-`filecat_close`).
+Every watcher carries an atomic refcount plus two set-once latches,
+`closing` and `destroyed`. The model is consistent across all three
+backends and is the reason concurrent close/destroy is safe.
+
+```
+filecat_open       → refcount = 1                 (owner ref)
+filecat_next_event → retain → poll() → release    (refcount transiently +1)
+filecat_close      → CAS closing 0→1, wake eventfd, return
+filecat_destroy    → CAS destroyed 0→1, ensure closing, release owner ref
+last release       → watcher_free()
+```
+
+Three things fall out of this model:
+
+1. **`filecat_close` from another thread interrupts an in-flight
+   `filecat_next_event`.** The eventfd write is the wake; `poll(2)`
+   returns immediately; the in-flight call observes `FILECAT_ERR_CLOSED`
+   and returns. No spin, no signal handling.
+2. **The watcher cannot be freed underneath an in-flight call.** While
+   `filecat_next_event` is parked in `poll(2)`, refcount ≥ 2. Even if
+   another thread calls `filecat_destroy` immediately, that call only
+   drops the owner ref; the last release (and therefore `watcher_free`)
+   doesn't run until the consumer's release also fires.
+3. **`filecat_close` and `filecat_destroy` are idempotent.** Both use
+   atomic CAS on their respective latches; the second concurrent call
+   is a no-op. This matters for cgo finalizer patterns where the
+   binding's `Close` and the runtime's finalizer can race.
+
+### 6.3 The contract
+
+- **One concurrent reader per watcher.** `filecat_next_event` is **not**
+  internally serialized; two threads calling it on the same watcher
+  would race on the internal buffer cursor. Don't do that.
+- **`filecat_close` and `filecat_destroy` are safe from any thread, at
+  any time**, including during an in-flight `filecat_next_event`. They
+  are idempotent.
+- **Different watchers are fully independent** and may be driven from
+  different threads with no coordination.
+
+### 6.4 The intended cgo shape
+
+```
+Goroutine A (owner)            Goroutine B (worker)
+─────────────────              ────────────────────
+                               for {
+                                 filecat_next_event(w, &ev)  // parks in poll(2)
+                                 ...send onto channel...
+                               }
+
+ctx.Done() fires
+filecat_close(w)        ───►   eventfd wakes poll(2)
+                               filecat_next_event returns ERR_CLOSED
+                               worker exits
+join worker
+filecat_destroy(w)      ───►   last release → watcher_free
+```
+
+This is the model the C ABI was designed for: one goroutine per watcher,
+context cancellation closes the watcher, the worker exits cleanly, the
+finalizer (or explicit `Close`) destroys. No internal locking on the C
+side, no thread attach/detach problems, no callback context confusion.
 
 ## 7. Future work
 
@@ -267,3 +354,4 @@ channel; the binding then awaits the worker's exit before calling
 - **`filecat-go`.** Higher-level Go module on top of `bindings/go/`,
   shipping the goroutine-per-watcher boilerplate, context-based
   cancellation, channel-based fan-out, and a glob/regex filter.
+- **Known limitation**: a small window of events with stale paths may slip out between the actual rename and our processing of IN_MOVED_FROM.

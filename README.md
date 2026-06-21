@@ -70,6 +70,10 @@ to `filecat_next_event` or `filecat_close`.
 `recursive` maps to Windows' `bWatchSubtree`: pass `0` to watch only the
 target directory; non-zero to watch all descendants.
 
+`ev.path` is relative to the directory passed to filecat_open. Callers that 
+need absolute paths should join the watch root with `ev.path` themselves 
+(and copy, since `ev.path` is invalidated by the next call).
+
 ### Windows long paths
 
 The Windows backend internally normalizes inputs with `GetFullPathNameW` and
