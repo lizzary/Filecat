@@ -11,6 +11,16 @@
 #ifndef FILECAT_BENCH_HELPERS_H
 #define FILECAT_BENCH_HELPERS_H
 
+/* glibc gates clock_gettime / CLOCK_MONOTONIC / nanosleep / mkdtemp /
+ * strdup / lstat behind feature test macros. _GNU_SOURCE unlocks them in
+ * one shot, and MUST appear before the first system header — otherwise
+ * the include guards have already settled the visible symbol set. This
+ * matters when bench_helpers.h is included BEFORE test_helpers.h (which
+ * also defines _GNU_SOURCE, but only inside its own #ifndef block). */
+#if !defined(_WIN32) && !defined(_GNU_SOURCE)
+#  define _GNU_SOURCE 1
+#endif
+
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>

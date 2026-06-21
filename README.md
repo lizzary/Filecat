@@ -194,7 +194,37 @@ bench/run.sh                        # or invoke the binaries individually
 | `bench_rss`        | resident set size delta when opening a recursive watcher over N subdirectories    |
 | `bench_open`       | `filecat_open` cold-start time vs subtree size (median of 3 trials)               |
 
-A few notes before publishing numbers:
+### Latest results
+
+Full data + per-platform commentary live in
+[bench/results/](bench/results/README.md). Two highlights from the first
+runs:
+
+**Linux** — Intel Xeon Gold 6144 @ 3.5 GHz (ESXi VM, 12 vCPU):
+
+| Metric                              | Result          |
+|-------------------------------------|-----------------|
+| Sustained throughput                | 84.9 k events/s, 0 overflows |
+| Touch → event latency p50 / p99     | 37 µs / 75 µs    |
+| `filecat_open`, recursive N=10000   | 107 ms (linear) |
+
+**Windows** — `filecat_open` for a recursive watch (single
+`CreateFileW` + `ReadDirectoryChangesW(bWatchSubtree=TRUE)`):
+
+| N            | `filecat_open` |
+|--------------|----------------|
+| 0            | 0.032 ms       |
+| 10           | 0.040 ms       |
+| 10000        | 0.066 ms       |
+
+That 107 ms vs 0.066 ms at N=10000 is the **~1600× platform-asymmetry
+datapoint** — and it's architectural, not implementation. inotify
+has no recursive mode at the kernel layer, so this gap is the cost any
+inotify-based library pays on Linux. Filecat's contribution is using
+the *most native* mechanism on each platform rather than emulating one
+worldview everywhere.
+
+### Caveats
 
 - `bench_rss` and `bench_open` are designed to expose platform asymmetry:
   Linux registers one inotify watch per directory (O(N) memory and time),
@@ -206,9 +236,6 @@ A few notes before publishing numbers:
 - On Linux, `bench_rss` and `bench_open` honor `fs.inotify.max_user_watches`;
   the backend is best-effort, so values above the cap will print but won't
   reflect a fully-watched tree.
-
-> _Headline numbers and comparison runs (vs fswatch and raw inotify/RDCW)
-> will land under `bench/results/` after a documented hardware baseline._
 
 ## Demo
 

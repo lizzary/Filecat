@@ -1,0 +1,40 @@
+=== Filecat benchmark run: 2026-06-21T12:18:30Z ===
+uname: Linux 6.1.0-37-amd64 x86_64
+cpu:   Intel(R) Xeon(R) Gold 6144 CPU @ 3.50GHz
+host:  ESXi VM, 12 vCPU, 6 GB RAM
+
+--- bench_throughput ---
+bench_throughput
+  producers      = 4
+  duration       = 10.001 s
+  producer ops   = 849246 (84914 ops/sec)
+  events drained = 849246 (84914 events/sec)
+  overflows      = 0
+
+--- bench_latency ---
+bench_latency
+  samples  = 5000 (valid 5000, timeouts 0)
+  min      = 17.24 us
+  p50      = 37.37 us
+  p90      = 49.31 us
+  p99      = 75.19 us
+  p999     = 136.81 us
+  max      = 217.53 us
+
+--- bench_rss ---
+bench_rss
+  fs.inotify.max_user_watches = 45909 (per-user kernel cap)
+  N=0        RSS before=   876 KB   after=   876 KB   delta=    +0 KB
+  N=10       RSS before=   876 KB   after=  1660 KB   delta=  +784 KB
+  N=100      RSS before=  1660 KB   after=  1660 KB   delta=    +0 KB
+  N=1000     RSS before=  1660 KB   after=  1764 KB   delta=  +104 KB
+  N=10000    RSS before=  1760 KB   after=  2168 KB   delta=  +408 KB
+
+--- bench_open ---
+bench_open
+  (median of 3 trials per N; recursive)
+  N=0        open =    0.035 ms
+  N=10       open =    0.294 ms
+  N=100      open =    0.905 ms
+  N=1000     open =    9.988 ms
+  N=10000    open =  107.403 ms

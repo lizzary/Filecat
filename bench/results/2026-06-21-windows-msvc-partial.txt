@@ -1,0 +1,24 @@
+=== Filecat benchmark run: 2026-06-21 (local) ===
+uname:  Windows 11 Home (MSYS2 / MinGW-w64 GCC 16.1, Ninja)
+cpu:    (developer workstation; not pinned, not isolated)
+host:   bare metal
+status: PARTIAL — only bench_open and bench_rss were captured during the
+        initial smoke run. Re-run on a quiet workstation to publish
+        throughput/latency numbers.
+
+--- bench_open ---
+bench_open
+  (median of 3 trials per N; recursive)
+  N=0        open =    0.032 ms
+  N=10       open =    0.040 ms
+  N=100      open =    0.040 ms
+  N=1000     open =    0.068 ms
+  N=10000    open =    0.066 ms
+
+--- bench_rss ---
+bench_rss
+  N=0        RSS before=  4800 KB   after=  4824 KB   delta=   +24 KB
+  N=10       RSS before=  4864 KB   after=  4864 KB   delta=    +0 KB
+  N=100      RSS before=  4872 KB   after=  4880 KB   delta=    +8 KB
+  N=1000     RSS before=  4872 KB   after=  4876 KB   delta=    +4 KB
+  N=10000    RSS before=  4888 KB   after=  4892 KB   delta=    +4 KB

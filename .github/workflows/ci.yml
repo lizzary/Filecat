@@ -27,6 +27,7 @@ jobs:
             os: ubuntu-latest
             cc: gcc
             build_type: Release
+            bench: true
           - name: linux-clang-release
             os: ubuntu-latest
             cc: clang
@@ -39,6 +40,7 @@ jobs:
             os: macos-latest
             cc: clang
             build_type: Release
+            bench: true
           - name: windows-msvc-debug
             os: windows-latest
             msvc: true
@@ -47,6 +49,7 @@ jobs:
             os: windows-latest
             msvc: true
             build_type: Release
+            bench: true
 
     steps:
       - uses: actions/checkout@v4
@@ -72,6 +75,7 @@ jobs:
         run: |
           cmake -B build \
             ${{ matrix.msvc && '-G Ninja' || '' }} \
+            ${{ matrix.bench && '-DFILECAT_BUILD_BENCH=ON' || '' }} \
             -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
 
       - name: Build
