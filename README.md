@@ -10,25 +10,45 @@ be embedded into higher-level runtimes via FFI/cgo.
 
 ## Why Filecat
 
-Go's [`fsnotify`](https://github.com/fsnotify/fsnotify) does not support
-recursive watching: inotify is non-recursive, so any "watch a whole tree"
-abstraction written in pure Go has to walk the tree and register one watch
-per directory in user space. On a large source tree (a monorepo, a
-`node_modules`, a build cache) this routinely costs **gigabytes of RSS** and
-**tens of seconds of cold-start time** before the first event can be
-delivered — long enough that the tree has already changed under you.
+Go's [`fsnotify`](https://github.com/fsnotify/fsnotify) intentionally does
+not provide recursive watching, on any of its supported platforms. The
+canonical workaround — walk the tree from Go and register one fsnotify
+watcher per directory — pays a high price on real-world trees:
 
-Filecat pushes recursion down to each platform's native subsystem
-(`inotify` / `ReadDirectoryChangesW` / `FSEvents`) behind a single C ABI,
-so callers get `(type, path)` events without managing a recursive walker
-or a per-directory watch table themselves.
+- A `map[int]string` of watch-descriptor-to-absolute-path in the Go heap,
+  plus the GC overhead of keeping it live.
+- One `inotify_add_watch` syscall per directory at startup, with no
+  events delivered until the walk finishes.
+- One Go-side watcher object per directory, with its own goroutine /
+  channel plumbing depending on the wrapper.
 
-A reference cgo binding lives under [`bindings/go/`](bindings/go/); a
-higher-level Go module (`filecat-go`, separate repo) is planned on top of
-it.
+On a `node_modules`, a monorepo, or a build cache this is the difference
+between a watcher that comes up in milliseconds and one that takes
+seconds-to-minutes to be ready and holds hundreds of MB to multiple GB of
+RSS while doing so. See [`bench/results/`](bench/results/) for the actual
+numbers on a documented baseline.
 
-For the rationale behind the public API shape, the rename-event unification,
-and the per-platform memory/latency trade-offs, see
+Filecat sits below that layer:
+
+- On **Windows**, a single `ReadDirectoryChangesW` handle with
+  `bWatchSubtree=TRUE` covers the entire subtree. **O(1) handles,
+  O(1) cold start.**
+- On **macOS**, a single `FSEvents` stream covers the entire subtree.
+  **O(1) streams, O(1) cold start.**
+- On **Linux**, the inotify subsystem itself does not support recursion
+  — no library can change that in user space. What Filecat does change
+  is the constant factor: the watch table is a flat open-addressed hash
+  map in C, indexed by `wd`, holding *relative* paths only; no Go
+  runtime, no GC, no per-directory allocator churn. **Still O(N)
+  directories, just a much smaller N's worth.**
+
+The library exposes a single C ABI of seven functions, so binding it
+from cgo (planned: [`bindings/go/`](bindings/go/), and a higher-level
+`filecat-go` module on top of it), Rust FFI, or Python `ctypes` is
+straightforward.
+
+For the rationale behind the blocking-pull API, the rename-event
+asymmetry across platforms, and the lifecycle / cancellation model, see
 [`docs/DESIGN.md`](docs/DESIGN.md).
 
 ## Status
