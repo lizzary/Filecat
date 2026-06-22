@@ -5,6 +5,13 @@
 [![Release](https://github.com/lizzary/Filecat/actions/workflows/release.yml/badge.svg)](https://github.com/lizzary/Filecat/actions/workflows/release.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
+> **Two-layer file watching stack** — Filecat is the **C core**. For Go users,
+> see [**filecat-go**](https://github.com/lizzary/Filecat-go), which adds
+> Watchman-style event coalescing, rename → `Move` synthesis, modify debouncing,
+> and an idiomatic channel-based Go API on top of this library via cgo.
+>
+> See [Architecture](#architecture) for the full layering.
+
 A cross-platform C library for **recursive directory watching**, designed to
 be embedded into higher-level runtimes via FFI/cgo.
 
@@ -58,6 +65,57 @@ asymmetry across platforms, and the lifecycle / cancellation model, see
 | Windows  | `ReadDirectoryChangesW` | Implemented   |
 | Linux    | `inotify`               | Implemented   |
 | macOS    | `FSEvents`              | Implemented   |
+
+## Architecture
+
+Filecat sits between OS-native filesystem event APIs and Go consumers. The C
+core handles cross-platform recursive watching and emits raw events; the
+[filecat-go](https://github.com/lizzary/Filecat-go) layer handles event
+coalescing and exposes a Go-idiomatic channel API.
+
+```mermaid
+flowchart TB
+    User["<b>User Go application</b><br/><code>for ev := range w.Events()</code>"]
+
+    subgraph GoLayer["📦  filecat-go &nbsp;·&nbsp; Go semantic layer (cgo)"]
+        direction LR
+        API["<b>Channel-based API</b><br/>chan Event<br/>Move · Create · Modify · Remove"]
+        Pipeline["<b>Coalescing pipeline</b><br/>Batch drain (amortize cgo cost)<br/>Rename-pair → Move synthesis<br/>Modify dedup / debounce"]
+    end
+
+    subgraph CLayer["⚙️  filecat &nbsp;·&nbsp; C core library"]
+        direction TB
+        ABI["<b>Unified C ABI</b><br/><code>filecat_event_t</code> — raw OS events"]
+        Linux["<b>Linux</b><br/>inotify"]
+        Windows["<b>Windows</b><br/>ReadDirectoryChangesW"]
+        Mac["<b>macOS</b><br/>FSEvents"]
+        ABI --> Linux
+        ABI --> Windows
+        ABI --> Mac
+    end
+
+    Kernel["<b>OS kernel</b> — filesystem event syscalls"]
+
+    User --> GoLayer
+    GoLayer -. "cgo: filecat_next_event()" .-> CLayer
+    CLayer --> Kernel
+
+    classDef neutral fill:#f1efe8,stroke:#888780,stroke-width:1px,color:#2c2c2a
+    classDef goLayer fill:#e1f5ee,stroke:#0f6e56,stroke-width:1px,color:#04342c
+    classDef cLayer fill:#e6f1fb,stroke:#185fa5,stroke-width:1px,color:#042c53
+    classDef comp fill:#eeedfe,stroke:#534ab7,stroke-width:1px,color:#26215c
+
+    class User,Kernel neutral
+    class API,Pipeline,ABI,Linux,Windows,Mac comp
+    class GoLayer goLayer
+    class CLayer cLayer
+```
+
+The boundary between the two layers is intentional: OS-specific behavior
+(rename-event pairing semantics, watch-descriptor lifecycle, queue-overflow
+recovery) stays in the C core where the platform APIs live, while batch
+coalescing and rename → `Move` synthesis happen in the Go layer where GC,
+maps, and goroutines make them cheap to express.
 
 ## Usage
 
