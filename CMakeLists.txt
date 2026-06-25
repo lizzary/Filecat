@@ -1,4 +1,13 @@
 cmake_minimum_required(VERSION 3.15)
+
+# macOS deployment target: the macOS backend uses
+# kFSEventStreamCreateFlagUseExtendedData (FSEvents v2), introduced in 10.13.
+# Pin here BEFORE project() so toolchain detection picks it up. Callers can
+# override on the command line with -DCMAKE_OSX_DEPLOYMENT_TARGET=...
+if(NOT DEFINED CMAKE_OSX_DEPLOYMENT_TARGET)
+    set(CMAKE_OSX_DEPLOYMENT_TARGET 10.13)
+endif()
+
 project(filecat LANGUAGES C VERSION 0.1.0)
 
 set(CMAKE_C_STANDARD 11)

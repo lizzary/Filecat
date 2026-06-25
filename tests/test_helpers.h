@@ -21,12 +21,19 @@
  *  - Path separator. Linux/macOS use '/', Windows '\\'. Tests compare
  *    against expected paths using the TH_SEP macro.
  *
- *  - Rename pairing. Linux inotify and Windows ReadDirectoryChangesW
- *    emit a strict RENAMED_OLD -> RENAMED_NEW pair. macOS FSEvents
- *    reports a single rename flag on both sides without pairing, which
- *    our backend exposes as two RENAMED_OLD events. Use
- *    th_collector_contains_any_rename for cross-platform assertions and
- *    gate ordering checks on TH_RENAME_TRACKED.
+ *  - Rename pairing by type. Linux inotify and Windows ReadDirectoryChangesW
+ *    emit a strict RENAMED_OLD -> RENAMED_NEW pair. macOS FSEvents reports
+ *    a single rename flag on both sides without pairing, which our backend
+ *    exposes as two RENAMED_OLD events. Use th_collector_contains_any_rename
+ *    for cross-platform assertions and gate ordering checks on
+ *    TH_RENAME_TRACKED.
+ *
+ *  - Correlation id. event_correlation_id is the cross-platform pairing
+ *    key (cookie on Linux, NTFS FileId on Windows, inode on macOS). It
+ *    is non-zero on both halves of every rename on every platform; on
+ *    Win/mac it is also non-zero on non-rename events. The collector
+ *    records it per event; use th_collector_correlation_id /
+ *    th_collector_correlation_id_any_rename to query it in assertions.
  *
  *  - Event coalescing. FSEvents may coalesce rapid create+delete on the
  *    same path into one event with both flags set; the priority in
@@ -503,7 +510,8 @@ static void th_mutex_unlock (th_mutex_t *m) { pthread_mutex_unlock(m); }
 
 typedef struct {
     filecat_event_type_t type;
-    char                *path;   /* owned */
+    uint64_t             correlation_id;   /* ev.event_correlation_id at capture */
+    char                *path;             /* owned */
 } th_event_t;
 
 typedef struct {
@@ -552,8 +560,9 @@ static void *th_collector_loop_(void *arg)
             c->events = e;
             c->cap    = newcap;
         }
-        c->events[c->n].type = ev.type;
-        c->events[c->n].path = path;
+        c->events[c->n].type           = ev.type;
+        c->events[c->n].correlation_id = ev.event_correlation_id;
+        c->events[c->n].path           = path;
         c->n++;
         th_mutex_unlock(&c->mu);
     }
@@ -670,6 +679,45 @@ static int th_collector_find_locked(th_collector_t *c,
             strcmp(c->events[i].path, path) == 0) return i;
     }
     return -1;
+}
+
+/* Return the correlation_id of the first event matching (type, path), or
+ * 0 if no such event was recorded. Note: 0 is also a legitimate
+ * correlation_id value ("backend didn't provide one"), so callers that
+ * need to distinguish "missing event" from "event with id 0" should
+ * th_collector_contains first. */
+static uint64_t th_collector_correlation_id(th_collector_t *c,
+                                            filecat_event_type_t type,
+                                            const char *path) TH_UNUSED;
+static uint64_t th_collector_correlation_id(th_collector_t *c,
+                                            filecat_event_type_t type,
+                                            const char *path)
+{
+    th_mutex_lock(&c->mu);
+    uint64_t id = 0;
+    for (int i = 0; i < c->n; i++) {
+        if (c->events[i].type == type &&
+            strcmp(c->events[i].path, path) == 0) {
+            id = c->events[i].correlation_id;
+            break;
+        }
+    }
+    th_mutex_unlock(&c->mu);
+    return id;
+}
+
+/* Cross-platform helper: returns the correlation_id of whichever rename
+ * event arrived for `path` (RENAMED_OLD on every backend; RENAMED_NEW only
+ * on Linux/Windows). 0 if no rename event matched. */
+static uint64_t th_collector_correlation_id_any_rename(
+    th_collector_t *c, const char *path) TH_UNUSED;
+static uint64_t th_collector_correlation_id_any_rename(
+    th_collector_t *c, const char *path)
+{
+    uint64_t id = th_collector_correlation_id(c, FILECAT_EVENT_RENAMED_OLD, path);
+    if (id == 0)
+        id = th_collector_correlation_id(c, FILECAT_EVENT_RENAMED_NEW, path);
+    return id;
 }
 
 #endif /* FILECAT_TEST_HELPERS_H */

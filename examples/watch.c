@@ -2,11 +2,13 @@
  *
  *   filecat-watch <path> [recursive=0|1]
  *
- * Prints one line per filesystem event. Single-threaded, blocking; Ctrl+C
- * terminates the process (the OS reclaims the handle on exit). */
+ * Prints one line per filesystem event, with the cross-platform pairing
+ * id (see event_correlation_id / filecat_event_pairable in filecat.h).
+ * Single-threaded, blocking; Ctrl+C terminates the process. */
 
 #include "filecat/filecat.h"
 
+#include <inttypes.h>
 #include <stdio.h>
 #include <stdlib.h>
 
@@ -57,7 +59,19 @@ int main(int argc, char **argv)
     for (;;) {
         s = filecat_next_event(w, &ev);
         if (s == FILECAT_OK) {
-            printf("%-12s %s\n", type_name(ev.type), ev.path);
+            /* event_correlation_id is non-zero whenever the backend
+             * surfaces a pairing key (Linux: rename cookie; Windows:
+             * NTFS FileId; macOS: FSEvents inode). The inline helper
+             * filecat_event_pairable is sugar for "id != 0" and is what
+             * downstream code should branch on when building a rename-
+             * pairing map. */
+            if (filecat_event_pairable(&ev)) {
+                printf("%-12s id=0x%016" PRIx64 " %s\n",
+                       type_name(ev.type), ev.event_correlation_id, ev.path);
+            } else {
+                printf("%-12s id=-                  %s\n",
+                       type_name(ev.type), ev.path);
+            }
             fflush(stdout);
         } else if (s == FILECAT_ERR_OVERFLOW) {
             fprintf(stderr, "** overflow: events were dropped\n");

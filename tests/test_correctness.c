@@ -730,6 +730,105 @@ static int test_open_destroy_repeated_same_dir(void)
     return 0;
 }
 
+/* ============================================================== */
+/* Correlation-id contract (event.event_correlation_id +           */
+/* filecat_event_pairable)                                         */
+/* ============================================================== */
+
+/* Pure read of the field — verify the inline helper without any
+ * filesystem activity. Catches a regression where the helper drifts
+ * away from the documented "non-zero == pairable" rule. */
+static int test_pairable_helper_semantics(void)
+{
+    filecat_event_t zero    = { FILECAT_EVENT_CREATED,  "x", 0 };
+    filecat_event_t one     = { FILECAT_EVENT_CREATED,  "x", 1 };
+    filecat_event_t max_val = { FILECAT_EVENT_MODIFIED, "x", UINT64_MAX };
+
+    TH_ASSERT(filecat_event_pairable(&zero)    == 0);
+    TH_ASSERT(filecat_event_pairable(&one)     != 0);
+    TH_ASSERT(filecat_event_pairable(&max_val) != 0);
+    return 0;
+}
+
+/* A single rename(2) must surface two events whose event_correlation_id
+ * is identical and non-zero, regardless of platform.
+ *   Linux:   the two halves share the inotify rename cookie.
+ *   Windows: the two halves share the NTFS FileId.
+ *   macOS:   the two halves share the FSEvents-reported inode (extended
+ *            data); the library exposes both halves as RENAMED_OLD, but
+ *            the id is identical, which is what downstream pairs on. */
+static int test_rename_pair_shares_correlation_id(void)
+{
+    char *dir = th_mktmp(); TH_ASSERT(dir);
+    char src[1024], dst[1024];
+    snprintf(src, sizeof(src), "%s" TH_SEP "before.txt", dir);
+    snprintf(dst, sizeof(dst), "%s" TH_SEP "after.txt",  dir);
+    TH_ASSERT_EQ(th_touch(src), 0);
+
+    filecat_watcher_t *w;
+    TH_ASSERT_OK(filecat_open(dir, 0, &w));
+    th_collector_t col;
+    TH_ASSERT_EQ(th_collector_start(&col, w), 0);
+
+    TH_ASSERT_EQ(th_rename(src, dst), 0);
+    th_sleep_ms(TH_SETTLE_MS);
+    th_collector_stop(&col);
+
+    TH_ASSERT(th_collector_contains_any_rename(&col, "before.txt"));
+    TH_ASSERT(th_collector_contains_any_rename(&col, "after.txt"));
+
+    uint64_t id_old = th_collector_correlation_id_any_rename(&col, "before.txt");
+    uint64_t id_new = th_collector_correlation_id_any_rename(&col, "after.txt");
+    TH_ASSERT(id_old != 0);
+    TH_ASSERT(id_new != 0);
+    TH_ASSERT_EQ(id_old, id_new);
+    TH_ASSERT_EQ(col.errors, 0);
+
+    th_collector_free(&col);
+    filecat_destroy(w);
+    th_rmtree(dir); free(dir);
+    return 0;
+}
+
+/* Per-platform correlation_id contract on a plain (non-rename) CREATE:
+ *   Linux:           cookie is 0 — inotify never tags non-rename events.
+ *   Windows / macOS: every event for a real file has a non-zero id
+ *                    (NTFS FileId / FSEvents inode), so a CREATE alone
+ *                    carries one even though there is nothing to pair
+ *                    with yet (a later delete-then-create that reuses
+ *                    the same FileId / inode would be the partner). */
+static int test_correlation_id_per_platform(void)
+{
+    char *dir = th_mktmp(); TH_ASSERT(dir);
+    char path[1024];
+    snprintf(path, sizeof(path), "%s" TH_SEP "plain.txt", dir);
+
+    filecat_watcher_t *w;
+    TH_ASSERT_OK(filecat_open(dir, 0, &w));
+    th_collector_t col;
+    TH_ASSERT_EQ(th_collector_start(&col, w), 0);
+
+    TH_ASSERT_EQ(th_touch(path), 0);
+    th_sleep_ms(TH_SETTLE_MS);
+    th_collector_stop(&col);
+
+    TH_ASSERT(th_collector_contains(&col, FILECAT_EVENT_CREATED, "plain.txt"));
+    uint64_t id = th_collector_correlation_id(&col,
+                                              FILECAT_EVENT_CREATED,
+                                              "plain.txt");
+#if defined(__linux__)
+    TH_ASSERT_EQ(id, 0);
+#else
+    TH_ASSERT(id != 0);
+#endif
+    TH_ASSERT_EQ(col.errors, 0);
+
+    th_collector_free(&col);
+    filecat_destroy(w);
+    th_rmtree(dir); free(dir);
+    return 0;
+}
+
 int main(void)
 {
     TH_RUN(test_strerror_all_codes);
@@ -757,5 +856,9 @@ int main(void)
     TH_RUN(test_path_with_spaces);
     TH_RUN(test_unicode_filename_event);
     TH_RUN(test_open_destroy_repeated_same_dir);
+    /* correlation_id contract */
+    TH_RUN(test_pairable_helper_semantics);
+    TH_RUN(test_rename_pair_shares_correlation_id);
+    TH_RUN(test_correlation_id_per_platform);
     TH_SUMMARY();
 }
