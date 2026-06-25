@@ -1,6 +1,8 @@
 #ifndef FILECAT_H
 #define FILECAT_H
 
+#include <stdint.h>
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -29,6 +31,22 @@ typedef struct {
      * Owned by the watcher: valid only until the next filecat_next_event /
      * filecat_close call on the same watcher. */
     const char *path;
+
+    /* Native pairing/identity that downstream bindings can use to coalesce
+     * rename pairs (and rename-via-delete+create) without rebuilding a
+     * path -> identity cache. 0 means the backend did not provide a value.
+     *
+     * Linux:   `cookie` is non-zero and shared by the FILECAT_EVENT_RENAMED_OLD
+     *          and FILECAT_EVENT_RENAMED_NEW that originate from a single
+     *          rename(2). All other events have cookie == 0. `file_id` is
+     *          always 0 (inotify does not surface inodes).
+     * Windows: `file_id` is the 64-bit NTFS/ReFS FileId from the underlying
+     *          FILE_NOTIFY_EXTENDED_INFORMATION record. A rename's OLD/NEW
+     *          pair shares it; a delete-then-create that reuses the same
+     *          MFT entry also shares it. `cookie` is always 0.
+     * macOS:   both fields are 0 currently. */
+    uint64_t    cookie;
+    uint64_t    file_id;
 } filecat_event_t;
 
 typedef struct filecat_watcher filecat_watcher_t;

@@ -462,8 +462,14 @@ filecat_status_t filecat_next_event(filecat_watcher_t *w, filecat_event_t *out)
     }
     memcpy(w->utf8_path, n->rel_path, need);
 
-    out->type = n->type;
-    out->path = w->utf8_path;
+    out->type    = n->type;
+    out->path    = w->utf8_path;
+    /* macOS FSEvents path does not yet surface a stable identity for
+     * downstream pairing. UseExtendedData support is planned; until then
+     * the caller must fall back to path-based heuristics, exactly as the
+     * library has always required on this platform. */
+    out->cookie  = 0;
+    out->file_id = 0;
 
     free(n->rel_path);
     free(n);

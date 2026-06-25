@@ -571,6 +571,11 @@ filecat_status_t filecat_next_event(filecat_watcher_t *w, filecat_event_t *out)
 
         out->type = map_inotify_mask(ev->mask);
         out->path = w->utf8_path;
+        /* cookie != 0 only on IN_MOVED_FROM / IN_MOVED_TO; shared by the
+         * two halves of one rename(2). Pass through as-is; downstream
+         * keys its rename-pairing hashmap on this. */
+        out->cookie  = (uint64_t)ev->cookie;
+        out->file_id = 0;
         status = FILECAT_OK;
         goto out_release;
     }

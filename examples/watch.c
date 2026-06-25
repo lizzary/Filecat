@@ -7,6 +7,7 @@
 
 #include "filecat/filecat.h"
 
+#include <inttypes.h>
 #include <stdio.h>
 #include <stdlib.h>
 
@@ -57,7 +58,10 @@ int main(int argc, char **argv)
     for (;;) {
         s = filecat_next_event(w, &ev);
         if (s == FILECAT_OK) {
-            printf("%-12s %s\n", type_name(ev.type), ev.path);
+            /* cookie and file_id are zero unless the backend surfaces them
+             * (Linux: cookie on rename pairs; Windows: file_id always). */
+            printf("%-12s cookie=%-10" PRIu64 " file_id=0x%016" PRIx64 " %s\n",
+                   type_name(ev.type), ev.cookie, ev.file_id, ev.path);
             fflush(stdout);
         } else if (s == FILECAT_ERR_OVERFLOW) {
             fprintf(stderr, "** overflow: events were dropped\n");

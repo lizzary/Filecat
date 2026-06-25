@@ -106,11 +106,11 @@ Adjust the exact constant names to match `include/filecat/filecat.h`.
 
 ## 3. Backend strategy
 
-| Platform | Subsystem                | Subtree handle | Memory shape | Cold start  |
-| -------- | ------------------------ | -------------- | ------------ | ----------- |
-| Linux    | `inotify`                | one watch per dir | O(N) dirs    | O(N) dirs   |
-| Windows  | `ReadDirectoryChangesW`  | one HANDLE        | O(1)         | O(1)        |
-| macOS    | `FSEvents`               | one stream        | O(1)         | O(1)        |
+| Platform | Subsystem                  | Subtree handle | Memory shape | Cold start  |
+| -------- | -------------------------- | -------------- | ------------ | ----------- |
+| Linux    | `inotify`                  | one watch per dir | O(N) dirs    | O(N) dirs   |
+| Windows  | `ReadDirectoryChangesExW`  | one HANDLE        | O(1)         | O(1)        |
+| macOS    | `FSEvents`                 | one stream        | O(1)         | O(1)        |
 
 The library does not pretend this asymmetry away. It does, however, make
 sure the *interface* is uniform: callers see `filecat_open(path, recursive=1)`
@@ -137,19 +137,26 @@ not fail `filecat_open`. The caller can detect partial coverage by checking
 
 The watched directory itself does not produce events: inotify SELF
 events (`IN_DELETE_SELF`, `IN_MOVE_SELF`, root-level `IN_ATTRIB`) are
-silently dropped. This mirrors `ReadDirectoryChangesW` on Windows, which
+silently dropped. This mirrors `ReadDirectoryChangesExW` on Windows, which
 never reports changes to the watch root. Callers that need to know
 when the root disappears should watch the parent directory.
 
 Known limitation: a small window of events with stale paths may slip
 out between the actual rename and our processing of IN_MOVED_FROM.
 
-### 3.2 Windows — `ReadDirectoryChangesW`
+### 3.2 Windows — `ReadDirectoryChangesExW`
 
-A single `CreateFileW` with `FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OVERLAPPED`
-opens the watch root. `ReadDirectoryChangesW(bWatchSubtree=TRUE, ...)` is
-issued against it with a generously sized buffer (subject to the 64 KB
-limit on remote filesystems, see §5).
+A single `CreateFileW` with `FILE_FLAG_BACKUP_SEMANTICS` opens the watch
+root. `ReadDirectoryChangesExW(bWatchSubtree=TRUE, ...,
+ReadDirectoryNotifyExtendedInformation)` is issued against it with a
+generously sized buffer (subject to the 64 KB limit on remote filesystems,
+see §5).
+
+`ReadDirectoryChangesExW` (Windows 10 1709+ / Windows 11) is used instead
+of the legacy `ReadDirectoryChangesW` so the buffer carries
+`FILE_NOTIFY_EXTENDED_INFORMATION` records. Each record's `FileId` (the
+64-bit NTFS/ReFS file reference) is surfaced via `filecat_event_t.file_id`
+and is what binding-layer rename coalescers (`filecat-go`) key on.
 
 The OS handles recursion internally: one HANDLE covers the entire subtree,
 so memory and cold-start are O(1) regardless of subtree size. The cost is
@@ -188,18 +195,23 @@ higher-level binding such as `filecat-go`) reconcile.
 
 | Platform | Native shape | Filecat surface |
 | -------- | ------------ | --------------- |
-| Linux    | `IN_MOVED_FROM` (with a `cookie`) followed by `IN_MOVED_TO` (same cookie). Either may appear alone when the move crosses the watch boundary. | Two events emitted in order: `FILECAT_EVENT_RENAMED_OLD` for the FROM side, `FILECAT_EVENT_RENAMED_NEW` for the TO side. The cookie is **not** exposed — callers that need pairing rely on adjacency in the event stream. A half-move (FROM or TO without its mate) is emitted as just that one event. |
-| Windows  | `FILE_ACTION_RENAMED_OLD_NAME` immediately followed by `FILE_ACTION_RENAMED_NEW_NAME` in the same `ReadDirectoryChangesW` buffer (MSDN-guaranteed adjacency). | Same surface as Linux: `FILECAT_EVENT_RENAMED_OLD` then `FILECAT_EVENT_RENAMED_NEW`. Adjacency is structurally guaranteed by the OS. |
-| macOS    | `kFSEventStreamEventFlagItemRenamed` fires on **each** side of the rename, with no shared identifier and no guaranteed adjacency. The flag alone carries no "this is the old side" / "this is the new side" information. | The FSEvents backend can only emit `FILECAT_EVENT_RENAMED_OLD` — once per side. A single rename therefore appears as **two `RENAMED_OLD` events** whose adjacency is best-effort, never guaranteed by the OS. There is no `FILECAT_EVENT_RENAMED_NEW` on macOS. |
+| Linux    | `IN_MOVED_FROM` (with a `cookie`) followed by `IN_MOVED_TO` (same cookie). Either may appear alone when the move crosses the watch boundary. | Two events emitted in order: `FILECAT_EVENT_RENAMED_OLD` for the FROM side, `FILECAT_EVENT_RENAMED_NEW` for the TO side. The kernel `cookie` is surfaced via `filecat_event_t.cookie` (zero on all other events); downstream pairs OLD/NEW by cookie rather than by adjacency. A half-move (FROM or TO without its mate) is emitted as just that one event, still carrying the cookie. |
+| Windows  | `FILE_ACTION_RENAMED_OLD_NAME` immediately followed by `FILE_ACTION_RENAMED_NEW_NAME` in the same `ReadDirectoryChangesExW` buffer (MSDN-guaranteed adjacency). | Same surface as Linux: `FILECAT_EVENT_RENAMED_OLD` then `FILECAT_EVENT_RENAMED_NEW`. Both events carry the same `file_id` (the NTFS FileId), so downstream can pair by id. A delete-then-create that reuses the same MFT entry also shares it, which lets binding-layer coalescers recognize app-level renames implemented as remove+create. |
+| macOS    | `kFSEventStreamEventFlagItemRenamed` fires on **each** side of the rename, with no shared identifier and no guaranteed adjacency. The flag alone carries no "this is the old side" / "this is the new side" information. | The FSEvents backend can only emit `FILECAT_EVENT_RENAMED_OLD` — once per side. A single rename therefore appears as **two `RENAMED_OLD` events** whose adjacency is best-effort, never guaranteed by the OS. There is no `FILECAT_EVENT_RENAMED_NEW` on macOS, and `cookie` / `file_id` are zero (UseExtendedData wiring is planned). |
 
 **Implication for binding authors.** Cross-platform pairing logic does
 *not* belong in the C library; it belongs one layer up, where you also
 have a binding-language string type to hold the paired result. The recommended pattern is:
 
-- Linux / Windows: pair `RENAMED_OLD` with the immediately following
-  `RENAMED_NEW`. If the next event is not `RENAMED_NEW`, treat the
-  `RENAMED_OLD` as an unpaired half-move (the target left the watched
-  subtree).
+- Linux: pair `RENAMED_OLD` and `RENAMED_NEW` by their shared
+  non-zero `cookie`. Cookies arrive paired in practice but adjacency
+  is not relied on — the binding holds OLD in a short-lived hashmap
+  keyed by cookie and matches NEW out of order if needed. A cookie
+  that times out without its mate is the unpaired half-move case
+  (the target left the watched subtree).
+- Windows: same idea, but keyed on `file_id` instead of `cookie`. The
+  binding can additionally treat a `REMOVED(file_id=X)` immediately
+  followed by `CREATED(file_id=X)` as an app-level rename.
 - macOS: treat every `RENAMED_OLD` as "this path may have just changed
   identity; re-`stat` if you care." Two adjacent `RENAMED_OLD` events
   with a parent/sibling relationship are *probably* the two sides of one
@@ -231,7 +243,7 @@ downstream consumers see the same path they passed in.
 
 ### 5.2 Windows remote filesystems
 
-`ReadDirectoryChangesW` has a documented 64 KB buffer limit on
+`ReadDirectoryChangesExW` has a documented 64 KB buffer limit on
 network shares (the kernel cannot map larger buffers across the SMB
 boundary). The backend caps its buffer at 64 KB when the watch root
 resolves to a network drive, which slightly raises the overflow rate on
