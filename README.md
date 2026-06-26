@@ -49,14 +49,14 @@ Filecat sits below that layer:
   runtime, no GC, no per-directory allocator churn. **Still O(N)
   directories, just a much smaller N's worth.**
 
-The library exposes a single C ABI of seven functions, so binding it
-from cgo (planned: [`bindings/go/`](bindings/go/), and a higher-level
-`filecat-go` module on top of it), Rust FFI, or Python `ctypes` is
-straightforward.
+The library exposes a small C ABI (five functions plus an inline pairing
+helper), so binding it from cgo (planned: [`bindings/go/`](bindings/go/),
+and a higher-level `filecat-go` module on top of it), Rust FFI, or Python
+`ctypes` is straightforward.
 
-For the rationale behind the blocking-pull API, the rename-event
-asymmetry across platforms, and the lifecycle / cancellation model, see
-[`docs/DESIGN.md`](docs/DESIGN.md).
+For the rationale behind the blocking-pull API, the cross-platform
+correlation-id contract, the rename-event asymmetry, and the lifecycle /
+cancellation model, see [`docs/DESIGN.md`](docs/DESIGN.md).
 
 ## Status
 
@@ -151,6 +151,28 @@ target directory; non-zero to watch all descendants.
 `ev.path` is relative to the directory passed to filecat_open. Callers that 
 need absolute paths should join the watch root with `ev.path` themselves 
 (and copy, since `ev.path` is invalidated by the next call).
+
+### Event correlation
+
+Each event also carries `event_correlation_id`, a 64-bit pairing key
+populated from whatever native identity the OS gives us — the inotify
+rename cookie on Linux, the NTFS `FileId` on Windows, the FSEvents inode
+on macOS. Non-zero values that match across two events mean the events
+refer to the same logical file or rename:
+
+```c
+if (filecat_event_pairable(&ev)) {
+    /* Both halves of every rename share this id on every platform. */
+    /* On Windows/macOS unrelated events for the same file also share it. */
+    map_put(pending, ev.event_correlation_id, ev);
+}
+```
+
+`filecat_event_pairable` is an inline helper equivalent to
+`ev.event_correlation_id != 0`; on Linux it is zero outside rename events
+(inotify doesn't surface inodes), so the helper also tells you which
+events are worth buffering for pairing. See [`docs/DESIGN.md` §2.4](docs/DESIGN.md)
+for the full per-platform contract.
 
 ### Windows long paths
 
@@ -340,9 +362,11 @@ worldview everywhere.
 
 ## Demo
 
-`filecat-watch` is a 70-line CLI built from
+`filecat-watch` is a short CLI built from
 [examples/watch.c](examples/watch.c) — useful for smoke-testing the
-library against a real directory:
+library against a real directory. It prints one line per event with the
+`event_correlation_id` formatted as a hex id (or `-` when the backend did
+not surface one):
 
 ```bash
 ./build/filecat-watch /some/dir 1          # POSIX

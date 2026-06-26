@@ -129,6 +129,16 @@ static int test_directory_rename_within_tree(void)
     TH_ASSERT(th_collector_contains_any_rename(&col, "a"));
     TH_ASSERT(th_collector_contains_any_rename(&col, "b"));
 
+    /* The directory-rename pair (a -> b) must share a non-zero
+     * event_correlation_id on every backend — that is what lets
+     * downstream collapse the two halves regardless of which platform
+     * was used to surface them. */
+    uint64_t id_a = th_collector_correlation_id_any_rename(&col, "a");
+    uint64_t id_b = th_collector_correlation_id_any_rename(&col, "b");
+    TH_ASSERT(id_a != 0);
+    TH_ASSERT(id_b != 0);
+    TH_ASSERT_EQ(id_a, id_b);
+
     /* Critical: the new file must arrive under "b" with the native
      * separator, not "a". */
     TH_ASSERT(th_collector_contains(&col, FILECAT_EVENT_CREATED,
