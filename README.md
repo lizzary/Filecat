@@ -242,6 +242,99 @@ paths exceed `MAX_PATH` (260) are accepted without requiring the system-wide
 `LongPathsEnabled` registry setting. Paths the caller has already prefixed
 with `\\?\` or `\\.\` are passed through unchanged.
 
+## Per-platform event matrix
+
+The exhaustive map of *what the user does* → *what the OS emits* → *what
+Filecat emits*. Use it as a reference when wiring downstream logic. Event
+names are abbreviated (`ADDED` = `FILE_ACTION_ADDED`, `IN_CREATE` keeps
+the inotify prefix, `ItemCreated` = `kFSEventStreamEventFlagItemCreated`,
+etc.); the `id` annotation flags non-default `event_correlation_id`
+behavior.
+
+| User action | OS-native events | Filecat events |
+|---|---|---|
+| **① Create file** (`touch` / `fopen("w")`) | | |
+| &nbsp;&nbsp;Windows | `ADDED` | `CREATED` |
+| &nbsp;&nbsp;Linux | `IN_CREATE` | `CREATED` (id=0) |
+| &nbsp;&nbsp;macOS | `ItemCreated` (may coalesce `\|ItemModified`) | `CREATED` (falls back to `MODIFIED` when both flags set; see §3.3) |
+| **② Write file content** | | |
+| &nbsp;&nbsp;Windows | `MODIFIED`, often ×N (size / last-write / attrs each fire) | `MODIFIED` × N |
+| &nbsp;&nbsp;Linux | `IN_MODIFY` | `MODIFIED` (id=0) |
+| &nbsp;&nbsp;macOS | `ItemModified` | `MODIFIED` |
+| **③ Change attributes** (`chmod` / `SetFileAttributes`) | | |
+| &nbsp;&nbsp;Windows | `MODIFIED` (attrs filter) | `MODIFIED` |
+| &nbsp;&nbsp;Linux | `IN_ATTRIB` | `MODIFIED` (id=0) |
+| &nbsp;&nbsp;macOS | `ItemInodeMetaMod` / `XattrMod` / `FinderInfoMod` / `ChangeOwner` | `MODIFIED` |
+| **④ Delete file** (`unlink`) | | |
+| &nbsp;&nbsp;Windows | `REMOVED` | `REMOVED` |
+| &nbsp;&nbsp;Linux | `IN_DELETE` | `REMOVED` (id=0) |
+| &nbsp;&nbsp;macOS | `ItemRemoved` | `REMOVED` |
+| **⑤ Rename file, same parent** (`mv a b`) | | |
+| &nbsp;&nbsp;Windows | `RENAMED_OLD_NAME(a)` + `RENAMED_NEW_NAME(b)`, shared `FileId` | `RENAMED_OLD(a)` + `RENAMED_NEW(b)`, **same id** |
+| &nbsp;&nbsp;Linux | `IN_MOVED_FROM(a,cookie)` + `IN_MOVED_TO(b,cookie)` | `RENAMED_OLD(a)` + `RENAMED_NEW(b)`, **same id** |
+| &nbsp;&nbsp;macOS | `ItemRenamed(a)` + `ItemRenamed(b)`, shared inode (no OLD/NEW hint) | `RENAMED_OLD(a)` + **`RENAMED_OLD(b)`**, **same id** |
+| **⑥ Move file across subdirs** (`mv a/x b/x`, both inside watch) | | |
+| &nbsp;&nbsp;Windows | `REMOVED(a/x)` + `ADDED(b/x)`, shared `FileId` (**not** `RENAMED_*` — that's only for same-parent) | `REMOVED(a/x)` + `CREATED(b/x)`, **same id** |
+| &nbsp;&nbsp;Linux | `IN_MOVED_FROM(a/x,cookie)` on wd_a + `IN_MOVED_TO(b/x,cookie)` on wd_b | `RENAMED_OLD(a/x)` + `RENAMED_NEW(b/x)`, **same id** |
+| &nbsp;&nbsp;macOS | `ItemRenamed(a/x)` + `ItemRenamed(b/x)`, shared inode | `RENAMED_OLD(a/x)` + `RENAMED_OLD(b/x)`, **same id** |
+| **⑦ Move OUT of watch** (half-move, destination outside) | | |
+| &nbsp;&nbsp;Windows | `REMOVED(a)` (destination invisible) | `REMOVED(a)` |
+| &nbsp;&nbsp;Linux | `IN_MOVED_FROM(a,cookie)`, no mate | `RENAMED_OLD(a)`, **id non-zero, mate never arrives** |
+| &nbsp;&nbsp;macOS | `ItemRenamed(a)` (source side only) | `RENAMED_OLD(a)` |
+| **⑧ Move INTO watch** (half-move, source outside) | | |
+| &nbsp;&nbsp;Windows | `ADDED(a)` (looks like a create) | `CREATED(a)` |
+| &nbsp;&nbsp;Linux | `IN_MOVED_TO(a,cookie)`, no mate | `RENAMED_NEW(a)`, **id non-zero, mate never arrives** |
+| &nbsp;&nbsp;macOS | `ItemRenamed(a)` (destination side only) | `RENAMED_OLD(a)` |
+| **⑨ Atomic replace** (`mv a b`, b already exists) | | |
+| &nbsp;&nbsp;Windows | `RENAMED_OLD_NAME(a)` + `RENAMED_NEW_NAME(b)` (original b silently overwritten) | `RENAMED_OLD(a)` + `RENAMED_NEW(b)`, **same id** |
+| &nbsp;&nbsp;Linux | `IN_MOVED_FROM(a,cookie)` + `IN_MOVED_TO(b,cookie)` (original b's inode silently freed) | `RENAMED_OLD(a)` + `RENAMED_NEW(b)`, **same id** |
+| &nbsp;&nbsp;macOS | `ItemRenamed(a)` + `ItemRenamed(b)`, shared new inode | `RENAMED_OLD(a)` + `RENAMED_OLD(b)`, **same id** |
+| **⑩ Create directory** (`mkdir`) | | |
+| &nbsp;&nbsp;Windows | `ADDED` (subtree handle auto-covers new dir) | `CREATED` |
+| &nbsp;&nbsp;Linux | `IN_CREATE \| IN_ISDIR` | `CREATED` (id=0); **library installs watch on the new subtree** |
+| &nbsp;&nbsp;macOS | `ItemCreated \| ItemIsDir` (stream auto-covers) | `CREATED` |
+| **⑪ Delete directory** (`rmdir`) | | |
+| &nbsp;&nbsp;Windows | `REMOVED` | `REMOVED` |
+| &nbsp;&nbsp;Linux | parent: `IN_DELETE \| IN_ISDIR`; the dir's own wd: `IN_DELETE_SELF` + `IN_IGNORED` | `REMOVED` (id=0); library swallows SELF / IGNORED and cleans wd map |
+| &nbsp;&nbsp;macOS | `ItemRemoved \| ItemIsDir` | `REMOVED` |
+| **⑫ Rename directory, same parent** (`mv a b`) | | |
+| &nbsp;&nbsp;Windows | `RENAMED_OLD_NAME(a)` + `RENAMED_NEW_NAME(b)`, shared `FileId` | `RENAMED_OLD(a)` + `RENAMED_NEW(b)`, **same id** |
+| &nbsp;&nbsp;Linux | `IN_MOVED_FROM(a,cookie,ISDIR)` + `IN_MOVED_TO(b,cookie,ISDIR)` | `RENAMED_OLD(a)` + `RENAMED_NEW(b)`, **same id**; library re-keys the wd map under the new name |
+| &nbsp;&nbsp;macOS | `ItemRenamed(a)` + `ItemRenamed(b)`, shared inode | `RENAMED_OLD(a)` + `RENAMED_OLD(b)`, **same id** |
+| **⑬ Move directory across subdirs** (`mv a/sub b/sub`) | | |
+| &nbsp;&nbsp;Windows | `REMOVED(a/sub)` + `ADDED(b/sub)`, shared `FileId` | `REMOVED(a/sub)` + `CREATED(b/sub)`, **same id** |
+| &nbsp;&nbsp;Linux | `IN_MOVED_FROM(a/sub,cookie)` on wd_a + `IN_MOVED_TO(b/sub,cookie)` on wd_b | `RENAMED_OLD(a/sub)` + `RENAMED_NEW(b/sub)`, **same id**; library re-wires the subtree's watches |
+| &nbsp;&nbsp;macOS | `ItemRenamed(a/sub)` + `ItemRenamed(b/sub)`, shared inode | `RENAMED_OLD(a/sub)` + `RENAMED_OLD(b/sub)`, **same id** |
+| **⑭ Directory moved OUT of watch** (half-move out) | | |
+| &nbsp;&nbsp;Windows | `REMOVED(a/sub)` | `REMOVED(a/sub)` |
+| &nbsp;&nbsp;Linux | `IN_MOVED_FROM(a/sub,cookie,ISDIR)` + later `IN_IGNORED` for each descendant wd | `RENAMED_OLD(a/sub)`, **id non-zero, no mate**; library recursively `inotify_rm_watch`'s the subtree |
+| &nbsp;&nbsp;macOS | `ItemRenamed(a/sub)` | `RENAMED_OLD(a/sub)` |
+| **⑮ Directory moved INTO watch** (half-move in, may carry pre-existing contents) | | |
+| &nbsp;&nbsp;Windows | `ADDED(a/sub)`; subtree handle auto-covers descendants for *future* activity | `CREATED(a/sub)`; future fs activity inside flows normally |
+| &nbsp;&nbsp;Linux | `IN_MOVED_TO(a/sub,cookie,ISDIR)`; **the kernel does NOT auto-watch descendants** | `RENAMED_NEW(a/sub)`, **id non-zero, no mate**; **library walks the moved-in subtree and `inotify_add_watch`'s every directory**. Pre-existing contents do NOT replay as CREATED; future activity inside flows normally. |
+| &nbsp;&nbsp;macOS | `ItemRenamed(a/sub)`; stream auto-covers descendants | `RENAMED_OLD(a/sub)`; future activity inside flows normally |
+
+### Cross-cutting observations
+
+- **Two-event move = same id, three platforms** (rows ⑤⑥⑨⑫⑬). This is
+  the cross-platform contract that `event_correlation_id` exists to
+  provide.
+- **Half-moves are single events** (rows ⑦⑧⑭⑮). The id is set on Linux
+  (cookie) and on Win/macOS (FileId / inode), but no second event ever
+  arrives — downstream pairing maps must flush stale entries after a
+  timeout.
+- **Linux fs side-effects** in rows ⑩⑬⑮: every new or moved-in
+  directory triggers a library-side recursive walk + `inotify_add_watch`
+  pass. The unavoidable cost of inotify not being recursive.
+- **macOS quirk**: every rename half is reported as `RENAMED_OLD` — no
+  `RENAMED_NEW` ever fires on macOS. Pairing by id is unaffected;
+  type-based branching needs to know this.
+- **Windows surprises**: same-parent rename → `RENAMED_*`, cross-parent
+  move → `REMOVED + ADDED` (rows ⑤ vs ⑥) — same shared `FileId` either
+  way. A single content write often produces multiple `MODIFIED` events
+  (size / last-write / attrs each one); deduplication is the consumer's
+  job.
+
 ## Build
 
 Pure CMake, no external dependencies. The library, the example CLI, and the
