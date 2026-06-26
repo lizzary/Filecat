@@ -419,12 +419,18 @@ filecat_status_t filecat_open(const char *path, int recursive,
     /* NoDefer:        deliver the first batch with no latency window.
      * FileEvents:     per-file granularity so we can map flags to
      *                 CREATED / REMOVED / MODIFIED / RENAMED (10.7+).
+     * UseCFTypes:     callback's eventPaths is a CFArrayRef (not char**).
+     *                 Required by UseExtendedData — Apple's docs say
+     *                 "implies" in places and "must be paired with" in
+     *                 others; on the CI image FSEventStreamCreate
+     *                 returns NULL without it, so we set both explicitly.
      * UseExtendedData: callback receives CFArray<CFDictionary> with the
      *                 path AND the inode per event (10.13+) — the inode
      *                 becomes event.event_correlation_id. */
     FSEventStreamContext ctx = {0, w, NULL, NULL, NULL};
     FSEventStreamCreateFlags flags = kFSEventStreamCreateFlagNoDefer
                                    | kFSEventStreamCreateFlagFileEvents
+                                   | kFSEventStreamCreateFlagUseCFTypes
                                    | kFSEventStreamCreateFlagUseExtendedData;
     w->stream = FSEventStreamCreate(NULL, fsevents_cb, &ctx, paths_array,
                                     kFSEventStreamEventIdSinceNow,

@@ -220,8 +220,13 @@ normalizes separators, and converts to UTF-8 for the public API.
 ### 3.3 macOS — `FSEvents`
 
 `FSEventStreamCreate` with `kFSEventStreamCreateFlagFileEvents |
-kFSEventStreamCreateFlagNoDefer | kFSEventStreamCreateFlagUseExtendedData`
-produces a per-file event stream rooted at the watch path. The stream is
+kFSEventStreamCreateFlagNoDefer | kFSEventStreamCreateFlagUseCFTypes |
+kFSEventStreamCreateFlagUseExtendedData` produces a per-file event stream
+rooted at the watch path. `UseCFTypes` switches the callback's `eventPaths`
+from `char **` to `CFArrayRef`, which is what `UseExtendedData` then
+populates with `CFDictionaryRef` entries — Apple's docs are inconsistent
+on whether `UseExtendedData` implies `UseCFTypes`, so we set both
+explicitly. The stream is
 attached to a private serial `dispatch_queue` via
 `FSEventStreamSetDispatchQueue`; the callback runs on that queue, parses
 each event's extended-data dictionary
