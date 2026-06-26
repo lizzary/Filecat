@@ -163,6 +163,112 @@ static int test_directory_rename_within_tree(void)
     return 0;
 }
 
+static int test_cross_subdir_file_move_shares_correlation_id(void)
+{
+    /* mv watched/a/x.txt watched/b/x.txt — one rename(2) whose source
+     * and destination parent directories differ. On Linux this hits a
+     * code path the same-dir rename test doesn't reach: IN_MOVED_FROM
+     * arrives on a's wd, IN_MOVED_TO on b's wd, so the cookie has to
+     * survive a wd-map lookup at each parent. Windows/macOS see a
+     * single subtree handle either way; this is primarily a Linux
+     * test that also confirms the cross-platform contract holds. */
+    char *dir = th_mktmp(); TH_ASSERT(dir);
+    char a[1024], b[1024], src[1024], dst[1024];
+    snprintf(a,   sizeof(a),   "%s" TH_SEP "a", dir);
+    snprintf(b,   sizeof(b),   "%s" TH_SEP "b", dir);
+    snprintf(src, sizeof(src), "%s" TH_SEP "a" TH_SEP "x.txt", dir);
+    snprintf(dst, sizeof(dst), "%s" TH_SEP "b" TH_SEP "x.txt", dir);
+    TH_ASSERT_EQ(th_mkdir(a),   0);
+    TH_ASSERT_EQ(th_mkdir(b),   0);
+    TH_ASSERT_EQ(th_touch(src), 0);
+
+    filecat_watcher_t *w;
+    TH_ASSERT_OK(filecat_open(dir, 1, &w));
+    th_collector_t col;
+    TH_ASSERT_EQ(th_collector_start(&col, w), 0);
+
+    TH_ASSERT_EQ(th_rename(src, dst), 0);
+    th_sleep_ms(TH_SETTLE_MS);
+    th_collector_stop(&col);
+
+    TH_ASSERT(th_collector_contains_any_rename(&col, "a" TH_SEP "x.txt"));
+    TH_ASSERT(th_collector_contains_any_rename(&col, "b" TH_SEP "x.txt"));
+
+    uint64_t id_src = th_collector_correlation_id_any_rename(&col,
+                                                             "a" TH_SEP "x.txt");
+    uint64_t id_dst = th_collector_correlation_id_any_rename(&col,
+                                                             "b" TH_SEP "x.txt");
+    TH_ASSERT(id_src != 0);
+    TH_ASSERT(id_dst != 0);
+    TH_ASSERT_EQ(id_src, id_dst);
+    TH_ASSERT_EQ(col.errors, 0);
+
+    th_collector_free(&col);
+    filecat_destroy(w);
+    th_rmtree(dir); free(dir);
+    return 0;
+}
+
+static int test_cross_subdir_dir_move_shares_correlation_id(void)
+{
+    /* mv watched/a/sub watched/b/sub — directory rename whose source
+     * and destination parents differ. After the move:
+     *   (1) the rename's two halves share a non-zero correlation_id,
+     *   (2) a file later created inside "sub" surfaces under the NEW
+     *       path (b/sub/...), proving Linux's wd-map re-installed the
+     *       watch under the new parent rather than emitting stale
+     *       "a/sub/..." entries. */
+    char *dir = th_mktmp(); TH_ASSERT(dir);
+    char a[1024], b[1024], src_dir[1024], dst_dir[1024], leaf[1024];
+    snprintf(a,       sizeof(a),       "%s" TH_SEP "a", dir);
+    snprintf(b,       sizeof(b),       "%s" TH_SEP "b", dir);
+    snprintf(src_dir, sizeof(src_dir), "%s" TH_SEP "a" TH_SEP "sub", dir);
+    snprintf(dst_dir, sizeof(dst_dir), "%s" TH_SEP "b" TH_SEP "sub", dir);
+    snprintf(leaf,    sizeof(leaf),
+             "%s" TH_SEP "b" TH_SEP "sub" TH_SEP "leaf.txt", dir);
+    TH_ASSERT_EQ(th_mkdir(a),       0);
+    TH_ASSERT_EQ(th_mkdir(b),       0);
+    TH_ASSERT_EQ(th_mkdir(src_dir), 0);
+
+    filecat_watcher_t *w;
+    TH_ASSERT_OK(filecat_open(dir, 1, &w));
+    th_collector_t col;
+    TH_ASSERT_EQ(th_collector_start(&col, w), 0);
+
+    TH_ASSERT_EQ(th_rename(src_dir, dst_dir), 0);
+    th_sleep_ms(TH_SETTLE_MS);
+
+    TH_ASSERT_EQ(th_touch(leaf), 0);
+    th_sleep_ms(TH_SETTLE_MS);
+    th_collector_stop(&col);
+
+    TH_ASSERT(th_collector_contains_any_rename(&col, "a" TH_SEP "sub"));
+    TH_ASSERT(th_collector_contains_any_rename(&col, "b" TH_SEP "sub"));
+
+    uint64_t id_src = th_collector_correlation_id_any_rename(&col,
+                                                             "a" TH_SEP "sub");
+    uint64_t id_dst = th_collector_correlation_id_any_rename(&col,
+                                                             "b" TH_SEP "sub");
+    TH_ASSERT(id_src != 0);
+    TH_ASSERT(id_dst != 0);
+    TH_ASSERT_EQ(id_src, id_dst);
+
+    /* The leaf created after the dir rename must arrive under the NEW
+     * path. A stale "a/sub/leaf.txt" would mean the wd-map rewiring
+     * (Linux) or FSEvents canonical path (mac/win) didn't track the
+     * move. */
+    TH_ASSERT(th_collector_contains(&col, FILECAT_EVENT_CREATED,
+                                    "b" TH_SEP "sub" TH_SEP "leaf.txt"));
+    TH_ASSERT(!th_collector_contains(&col, FILECAT_EVENT_CREATED,
+                                     "a" TH_SEP "sub" TH_SEP "leaf.txt"));
+    TH_ASSERT_EQ(col.errors, 0);
+
+    th_collector_free(&col);
+    filecat_destroy(w);
+    th_rmtree(dir); free(dir);
+    return 0;
+}
+
 static int test_rapid_create_delete_cycles(void)
 {
     /* Each iteration touches and immediately removes a unique path.
@@ -304,6 +410,8 @@ int main(void)
     TH_RUN(test_1k_files_in_root);
     TH_RUN(test_deep_tree_recursive);
     TH_RUN(test_directory_rename_within_tree);
+    TH_RUN(test_cross_subdir_file_move_shares_correlation_id);
+    TH_RUN(test_cross_subdir_dir_move_shares_correlation_id);
     TH_RUN(test_rapid_create_delete_cycles);
     TH_RUN(test_concurrent_close_idempotent);
     TH_RUN(test_many_subdirs_recursive);
