@@ -166,12 +166,15 @@ static int test_directory_rename_within_tree(void)
 static int test_cross_subdir_file_move_shares_correlation_id(void)
 {
     /* mv watched/a/x.txt watched/b/x.txt — one rename(2) whose source
-     * and destination parent directories differ. On Linux this hits a
-     * code path the same-dir rename test doesn't reach: IN_MOVED_FROM
-     * arrives on a's wd, IN_MOVED_TO on b's wd, so the cookie has to
-     * survive a wd-map lookup at each parent. Windows/macOS see a
-     * single subtree handle either way; this is primarily a Linux
-     * test that also confirms the cross-platform contract holds. */
+     * and destination parent directories differ. The contract asserted
+     * here is "two events with the same non-zero correlation_id"; the
+     * event TYPES differ by backend so we use the type-agnostic
+     * th_collector_correlation_id_for_path:
+     *   Linux:   RENAMED_OLD on a's wd, RENAMED_NEW on b's wd; shared cookie.
+     *   Windows: REMOVED in a's subtree, ADDED in b's subtree; shared FileId.
+     *            (ReadDirectoryChangesW only emits RENAMED_* for same-parent
+     *            renames; cross-subdir moves come through as remove+add.)
+     *   macOS:   RENAMED_OLD on both paths; shared inode. */
     char *dir = th_mktmp(); TH_ASSERT(dir);
     char a[1024], b[1024], src[1024], dst[1024];
     snprintf(a,   sizeof(a),   "%s" TH_SEP "a", dir);
@@ -191,15 +194,12 @@ static int test_cross_subdir_file_move_shares_correlation_id(void)
     th_sleep_ms(TH_SETTLE_MS);
     th_collector_stop(&col);
 
-    TH_ASSERT(th_collector_contains_any_rename(&col, "a" TH_SEP "x.txt"));
-    TH_ASSERT(th_collector_contains_any_rename(&col, "b" TH_SEP "x.txt"));
-
-    uint64_t id_src = th_collector_correlation_id_any_rename(&col,
-                                                             "a" TH_SEP "x.txt");
-    uint64_t id_dst = th_collector_correlation_id_any_rename(&col,
-                                                             "b" TH_SEP "x.txt");
-    TH_ASSERT(id_src != 0);
-    TH_ASSERT(id_dst != 0);
+    uint64_t id_src = th_collector_correlation_id_for_path(&col,
+                                                           "a" TH_SEP "x.txt");
+    uint64_t id_dst = th_collector_correlation_id_for_path(&col,
+                                                           "b" TH_SEP "x.txt");
+    TH_ASSERT(id_src != 0);   /* implicitly: an event for the src path arrived */
+    TH_ASSERT(id_dst != 0);   /* implicitly: an event for the dst path arrived */
     TH_ASSERT_EQ(id_src, id_dst);
     TH_ASSERT_EQ(col.errors, 0);
 
@@ -213,7 +213,11 @@ static int test_cross_subdir_dir_move_shares_correlation_id(void)
 {
     /* mv watched/a/sub watched/b/sub — directory rename whose source
      * and destination parents differ. After the move:
-     *   (1) the rename's two halves share a non-zero correlation_id,
+     *   (1) the rename's two halves share a non-zero correlation_id —
+     *       event types differ by backend (Windows surfaces this as
+     *       REMOVED + ADDED, not RENAMED_*; see the file-move sibling
+     *       test for the full per-platform breakdown), so we assert on
+     *       id alone via th_collector_correlation_id_for_path,
      *   (2) a file later created inside "sub" surfaces under the NEW
      *       path (b/sub/...), proving Linux's wd-map re-installed the
      *       watch under the new parent rather than emitting stale
@@ -242,15 +246,12 @@ static int test_cross_subdir_dir_move_shares_correlation_id(void)
     th_sleep_ms(TH_SETTLE_MS);
     th_collector_stop(&col);
 
-    TH_ASSERT(th_collector_contains_any_rename(&col, "a" TH_SEP "sub"));
-    TH_ASSERT(th_collector_contains_any_rename(&col, "b" TH_SEP "sub"));
-
-    uint64_t id_src = th_collector_correlation_id_any_rename(&col,
-                                                             "a" TH_SEP "sub");
-    uint64_t id_dst = th_collector_correlation_id_any_rename(&col,
-                                                             "b" TH_SEP "sub");
-    TH_ASSERT(id_src != 0);
-    TH_ASSERT(id_dst != 0);
+    uint64_t id_src = th_collector_correlation_id_for_path(&col,
+                                                           "a" TH_SEP "sub");
+    uint64_t id_dst = th_collector_correlation_id_for_path(&col,
+                                                           "b" TH_SEP "sub");
+    TH_ASSERT(id_src != 0);   /* implicitly: an event for "a/sub" arrived */
+    TH_ASSERT(id_dst != 0);   /* implicitly: an event for "b/sub" arrived */
     TH_ASSERT_EQ(id_src, id_dst);
 
     /* The leaf created after the dir rename must arrive under the NEW

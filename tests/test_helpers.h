@@ -720,4 +720,29 @@ static uint64_t th_collector_correlation_id_any_rename(
     return id;
 }
 
+/* Type-agnostic variant: returns the correlation_id of the first event
+ * matching `path`, regardless of event type. Use this when the test wants
+ * to verify the cross-platform "shared id" contract for a move whose
+ * surfaced event type differs by backend — most notably, Windows
+ * ReadDirectoryChangesW reports a cross-subdirectory move (different
+ * parent dirs under the same subtree watch) as REMOVED + ADDED rather
+ * than RENAMED_OLD + RENAMED_NEW, while the NTFS FileId on both halves
+ * stays the same. */
+static uint64_t th_collector_correlation_id_for_path(
+    th_collector_t *c, const char *path) TH_UNUSED;
+static uint64_t th_collector_correlation_id_for_path(
+    th_collector_t *c, const char *path)
+{
+    th_mutex_lock(&c->mu);
+    uint64_t id = 0;
+    for (int i = 0; i < c->n; i++) {
+        if (strcmp(c->events[i].path, path) == 0) {
+            id = c->events[i].correlation_id;
+            break;
+        }
+    }
+    th_mutex_unlock(&c->mu);
+    return id;
+}
+
 #endif /* FILECAT_TEST_HELPERS_H */
