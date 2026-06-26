@@ -49,8 +49,47 @@ Filecat sits below that layer:
   runtime, no GC, no per-directory allocator churn. **Still O(N)
   directories, just a much smaller N's worth.**
 
-The library exposes a small C ABI (five functions plus an inline pairing
-helper), so binding it from cgo (planned: [`bindings/go/`](bindings/go/),
+### Cross-platform rename pairing in a single 64-bit field
+
+Recursive watching is half the story. The other half is *what do you do
+with a rename when you get one* — every OS surfaces the two halves
+differently, and most cross-platform watchers either pretend the
+asymmetry doesn't exist (and break under load) or punt it to the caller
+(and force every binding to re-implement the same hashmap).
+
+Filecat puts a single `event_correlation_id` on every `filecat_event_t`,
+populated from whatever native identity the kernel actually surfaces:
+
+- **Linux** — the inotify rename cookie (non-zero on `RENAMED_OLD` /
+  `RENAMED_NEW`; the two halves of one `rename(2)` share it).
+- **Windows** — the NTFS / ReFS `FileId` from
+  `FILE_NOTIFY_EXTENDED_INFORMATION` (non-zero on every event; rename
+  pairs share it, and so does a `REMOVED + CREATED` pair from a
+  cross-subdirectory move or an MFT-reused delete+create).
+- **macOS** — the FSEvents extended-data inode (10.13+; non-zero on
+  every event; both halves of a rename share it).
+
+Two events with the same non-zero id refer to the same logical file or
+rename — *that one rule covers all three platforms*. The inline
+`filecat_event_pairable(&ev)` helper is sugar for `id != 0` so call
+sites read as "pair this or pass it through":
+
+```c
+if (filecat_event_pairable(&ev)) {
+    pending[ev.event_correlation_id] = ev;   /* pair on a hashmap key */
+} else {
+    emit(&ev);                                /* nothing to pair with */
+}
+```
+
+No path-keyed identity cache to keep in sync with the file system, no
+per-OS branching in the binding, no leaky `Move-or-Rename-or-Delete?`
+heuristic.
+
+### Small, embeddable C ABI
+
+The library exposes a small C ABI (five functions plus the inline
+pairing helper), so binding it from cgo (planned: [`bindings/go/`](bindings/go/),
 and a higher-level `filecat-go` module on top of it), Rust FFI, or Python
 `ctypes` is straightforward.
 
@@ -60,11 +99,11 @@ cancellation model, see [`docs/DESIGN.md`](docs/DESIGN.md).
 
 ## Status
 
-| Platform | Backend                 | Status        |
-|----------|-------------------------|---------------|
-| Windows  | `ReadDirectoryChangesW` | Implemented   |
-| Linux    | `inotify`               | Implemented   |
-| macOS    | `FSEvents`              | Implemented   |
+| Platform | Backend                                       | Pairing identity (`event_correlation_id`) | Status      |
+|----------|-----------------------------------------------|-------------------------------------------|-------------|
+| Windows  | `ReadDirectoryChangesExW` (Win 10 1709+)      | NTFS / ReFS `FileId`                      | Implemented |
+| Linux    | `inotify` + `eventfd` cancel channel          | inotify rename cookie                     | Implemented |
+| macOS    | `FSEvents` + extended data (macOS 10.13+)     | inode                                     | Implemented |
 
 ## Architecture
 
@@ -85,10 +124,10 @@ flowchart TB
 
     subgraph CLayer["filecat &nbsp;·&nbsp; C core library"]
         direction TB
-        ABI["<b>Unified C ABI</b><br/><code>filecat_event_t</code> — raw OS events"]
-        Linux["<b>Linux</b><br/>inotify"]
-        Windows["<b>Windows</b><br/>ReadDirectoryChangesW"]
-        Mac["<b>macOS</b><br/>FSEvents"]
+        ABI["<b>Unified C ABI</b><br/><code>filecat_event_t</code> — raw OS events<br/>+ <code>event_correlation_id</code> pairing key"]
+        Linux["<b>Linux</b><br/>inotify<br/><i>cookie → id</i>"]
+        Windows["<b>Windows</b><br/>ReadDirectoryChangesExW<br/><i>FileId → id</i>"]
+        Mac["<b>macOS</b><br/>FSEvents + extended data<br/><i>inode → id</i>"]
         ABI --> Linux
         ABI --> Windows
         ABI --> Mac
@@ -112,15 +151,22 @@ flowchart TB
 ```
 
 The boundary between the two layers is intentional: OS-specific behavior
-(rename-event pairing semantics, watch-descriptor lifecycle, queue-overflow
-recovery) stays in the C core where the platform APIs live, while batch
-coalescing and rename → `Move` synthesis happen in the Go layer where GC,
-maps, and goroutines make them cheap to express.
+(watch-descriptor lifecycle, queue-overflow recovery, the native flag /
+inode / FileId / cookie zoo) stays in the C core where the platform APIs
+live, while batch coalescing and rename → `Move` synthesis happen in the
+Go layer where GC, maps, and goroutines make them cheap to express.
+
+The pivot that makes the boundary clean is **`event_correlation_id`**:
+each backend funnels its native pairing key into the same 64-bit field,
+so the Go-side rename-pair → `Move` synthesis collapses to a single
+hashmap keyed on that field — no per-OS branching above the cgo wall,
+no path-based identity cache, no leaky `Move-or-Rename` heuristic.
 
 ## Usage
 
 ```c
 #include <filecat/filecat.h>
+#include <inttypes.h>
 #include <stdio.h>
 
 int main(void) {
@@ -133,7 +179,16 @@ int main(void) {
 
     filecat_event_t ev;
     while ((s = filecat_next_event(w, &ev)) == FILECAT_OK) {
-        printf("event=%d path=%s\n", (int)ev.type, ev.path);
+        /* event_correlation_id is the cross-platform pairing key:
+         * any two events sharing a non-zero id refer to the same
+         * logical file / rename. filecat_event_pairable is sugar
+         * for (ev.event_correlation_id != 0). */
+        if (filecat_event_pairable(&ev)) {
+            printf("event=%d path=%s id=0x%016" PRIx64 "\n",
+                   (int)ev.type, ev.path, ev.event_correlation_id);
+        } else {
+            printf("event=%d path=%s id=-\n", (int)ev.type, ev.path);
+        }
     }
 
     filecat_close(w);
@@ -148,31 +203,36 @@ to `filecat_next_event` or `filecat_close`.
 `recursive` maps to Windows' `bWatchSubtree`: pass `0` to watch only the
 target directory; non-zero to watch all descendants.
 
-`ev.path` is relative to the directory passed to filecat_open. Callers that 
-need absolute paths should join the watch root with `ev.path` themselves 
+`ev.path` is relative to the directory passed to `filecat_open`. Callers that
+need absolute paths should join the watch root with `ev.path` themselves
 (and copy, since `ev.path` is invalidated by the next call).
 
-### Event correlation
+### Pairing renames and moves
 
-Each event also carries `event_correlation_id`, a 64-bit pairing key
-populated from whatever native identity the OS gives us — the inotify
-rename cookie on Linux, the NTFS `FileId` on Windows, the FSEvents inode
-on macOS. Non-zero values that match across two events mean the events
-refer to the same logical file or rename:
+The typical use of `event_correlation_id` is buffering pairable events
+in a short-lived hashmap and flushing them as logical `Move` events when
+the second half arrives:
 
 ```c
-if (filecat_event_pairable(&ev)) {
-    /* Both halves of every rename share this id on every platform. */
-    /* On Windows/macOS unrelated events for the same file also share it. */
-    map_put(pending, ev.event_correlation_id, ev);
+filecat_event_t ev;
+while (filecat_next_event(w, &ev) == FILECAT_OK) {
+    if (!filecat_event_pairable(&ev)) {
+        emit_raw(&ev);                                 /* nothing to pair */
+        continue;
+    }
+    filecat_event_t *mate = map_pop(pending, ev.event_correlation_id);
+    if (mate) emit_move(mate, &ev);                    /* both halves arrived */
+    else      map_put(pending, ev.event_correlation_id, copy_of(&ev));
 }
 ```
 
-`filecat_event_pairable` is an inline helper equivalent to
-`ev.event_correlation_id != 0`; on Linux it is zero outside rename events
-(inotify doesn't surface inodes), so the helper also tells you which
-events are worth buffering for pairing. See [`docs/DESIGN.md` §2.4](docs/DESIGN.md)
-for the full per-platform contract.
+Per-platform: on Linux only `RENAMED_OLD` / `RENAMED_NEW` carry an id, so
+the helper returns 0 for plain create / modify / remove events and they
+fall straight through. On Windows and macOS every event for a real file
+has an id, so the same hashmap also catches `REMOVED + CREATED` pairs
+that share a `FileId` — exactly how cross-subdirectory moves and
+MFT-reused delete-then-create patterns surface there. See
+[`docs/DESIGN.md` §2.4](docs/DESIGN.md) for the full contract.
 
 ### Windows long paths
 
