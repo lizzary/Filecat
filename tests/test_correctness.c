@@ -23,13 +23,21 @@ static void *th_delayed_close_(void *arg)
     return NULL;
 }
 
-struct th_blocking_next_arg { filecat_watcher_t *w; filecat_status_t result; };
-static void *th_blocking_next_(void *arg)
+/* A consumer that loops in filecat_next_event until close cancels it,
+ * recording the terminal status and how many events it saw. Mirrors the
+ * shape of a real binding's reader thread (e.g. filecat-go's readLoop). */
+struct th_consumer_arg { filecat_watcher_t *w; filecat_status_t last; int events; };
+static void *th_consumer_loop_(void *arg)
 {
-    struct th_blocking_next_arg *a = (struct th_blocking_next_arg *)arg;
-    filecat_event_t ev;
-    a->result = filecat_next_event(a->w, &ev);
-    return NULL;
+    struct th_consumer_arg *a = (struct th_consumer_arg *)arg;
+    for (;;) {
+        filecat_event_t ev;
+        filecat_status_t s = filecat_next_event(a->w, &ev);
+        if (s == FILECAT_OK)           { a->events++; continue; }
+        if (s == FILECAT_ERR_OVERFLOW) continue;
+        a->last = s;   /* CLOSED (expected) or an unexpected error: stop */
+        return NULL;
+    }
 }
 
 struct th_two_touch_arg { const char *p1, *p2; int initial_delay_ms; };
@@ -355,25 +363,37 @@ static int test_close_from_another_thread_unblocks(void)
     return 0;
 }
 
-static int test_destroy_from_another_thread_unblocks(void)
+/* New-contract lifecycle (replaces the old "destroy unblocks a parked
+ * consumer" test, which relied on the now-removed refcounted concurrent
+ * destroy). A consumer thread blocks/cycles in filecat_next_event; another
+ * thread calls filecat_close to cancel it; the owner JOINS the consumer so
+ * no call is in flight, and ONLY THEN calls filecat_destroy. This is exactly
+ * the sequence the library now requires — and the one filecat-go performs in
+ * run() / Close(). */
+static int test_consumer_close_join_destroy(void)
 {
     char *dir = th_mktmp(); TH_ASSERT(dir);
     filecat_watcher_t *w;
-    TH_ASSERT_OK(filecat_open(dir, 0, &w));
+    TH_ASSERT_OK(filecat_open(dir, 1, &w));
 
-    struct th_blocking_next_arg na = { w, FILECAT_OK };
-    th_thread_t blocker;
-    TH_ASSERT_EQ(th_thread_create(&blocker, th_blocking_next_, &na), 0);
+    struct th_consumer_arg ca = { w, FILECAT_OK, 0 };
+    th_thread_t consumer;
+    TH_ASSERT_EQ(th_thread_create(&consumer, th_consumer_loop_, &ca), 0);
 
-    /* Ensure the consumer is parked inside filecat_next_event before
-     * destroying. */
+    /* Let the consumer park in next_event, then fire an event so it cycles
+     * through the bare window (return OK -> loop -> next_event) at least
+     * once before we cancel it. */
     th_sleep_ms(TH_SETTLE_MS);
-    filecat_destroy(w);
-    th_thread_join(blocker);
+    char p[1024];
+    snprintf(p, sizeof(p), "%s" TH_SEP "e.txt", dir);
+    TH_ASSERT_EQ(th_touch(p), 0);
+    th_sleep_ms(TH_SETTLE_MS);
 
-    TH_ASSERT_STATUS(na.result, FILECAT_ERR_CLOSED);
-    /* w is invalid past this point — must not touch it again. */
+    filecat_close(w);             /* cancel the blocking / cycling consumer */
+    th_thread_join(consumer);     /* JOIN before destroy (new contract) */
+    TH_ASSERT_STATUS(ca.last, FILECAT_ERR_CLOSED);
 
+    filecat_destroy(w);           /* safe: the consumer has returned */
     th_rmtree(dir); free(dir);
     return 0;
 }
@@ -414,9 +434,13 @@ static int test_two_watchers_in_one_dir(void)
 /* Strict API-contract tests                                       */
 /* ============================================================== */
 
-/* The typical shutdown sequence: close signals stop, then destroy drops
- * the owner ref. After close, next_event must report CLOSED; destroy
- * must then absorb the already-closed handle without double-free. */
+/* The typical shutdown sequence: close signals stop (waking a blocked
+ * consumer and latching CLOSED), then destroy releases the OS handle and
+ * frees. After close, next_event must report CLOSED. Because the backend now
+ * defers the native close (CloseHandle / close(fd) / FSEvents teardown) to
+ * destroy instead of doing it in close, this also checks destroy still
+ * releases the handle — on Windows a leaked directory handle would block the
+ * rmtree below and leave the directory on disk. */
 static int test_close_then_destroy(void)
 {
     char *dir = th_mktmp(); TH_ASSERT(dir);
@@ -428,13 +452,22 @@ static int test_close_then_destroy(void)
     TH_ASSERT_STATUS(filecat_next_event(w, &ev), FILECAT_ERR_CLOSED);
 
     filecat_destroy(w);
-    th_rmtree(dir); free(dir);
+
+    /* destroy must have released the directory handle: rmtree fully removes it. */
+    th_rmtree(dir);
+#ifdef _WIN32
+    TH_ASSERT(GetFileAttributesA(dir) == INVALID_FILE_ATTRIBUTES);
+#else
+    struct stat st;
+    TH_ASSERT(stat(dir, &st) != 0);
+#endif
+    free(dir);
     return 0;
 }
 
-/* destroy without a prior close: the close-handle fallback inside
- * watcher_close_handle must still release the directory handle so the
- * subsequent rmtree on Windows isn't blocked. */
+/* destroy without a prior close: destroy must release the directory handle
+ * directly (there is no separate close step that does it), so the subsequent
+ * rmtree on Windows isn't blocked by a leaked handle. */
 static int test_destroy_without_close(void)
 {
     char *dir = th_mktmp(); TH_ASSERT(dir);
@@ -842,7 +875,7 @@ int main(void)
     TH_RUN(test_recursive_subdir_events);
     TH_RUN(test_non_recursive_drops_subdir_events);
     TH_RUN(test_close_from_another_thread_unblocks);
-    TH_RUN(test_destroy_from_another_thread_unblocks);
+    TH_RUN(test_consumer_close_join_destroy);
     TH_RUN(test_two_watchers_in_one_dir);
     /* strict API-contract tests */
     TH_RUN(test_close_then_destroy);

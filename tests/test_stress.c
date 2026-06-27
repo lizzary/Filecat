@@ -2,7 +2,7 @@
  *
  * Exercises paths that the correctness suite hits only once each: thousands
  * of events, deep recursion, directory renames within the tree, and
- * concurrent close/destroy. They time-out at 60s per test (see CMake).
+ * concurrent close. They time-out at 60s per test (see CMake).
  *
  * Backend-specific caveats absorbed via test_helpers.h:
  *   - macOS FSEvents may coalesce rapid create+delete on the same path
@@ -322,8 +322,10 @@ static void *ccl_closer_(void *arg)
 
 static int test_concurrent_close_idempotent(void)
 {
-    /* 16 threads race to filecat_close. Watcher must remain valid for a
-     * single subsequent destroy, with no double-free / no hang. */
+    /* 16 threads race to filecat_close — the one call the contract allows to
+     * run concurrently from any thread, any number of times. The watcher must
+     * remain valid for a single subsequent (single-threaded) destroy, with no
+     * double-free and no hang. */
     char *dir = th_mktmp(); TH_ASSERT(dir);
     filecat_watcher_t *w;
     TH_ASSERT_OK(filecat_open(dir, 0, &w));
