@@ -357,61 +357,91 @@ per-event delivery.
   `filecat_close`, which aborts the in-flight wait so the syscall
   returns `ERROR_OPERATION_ABORTED` → `FILECAT_ERR_CLOSED`. (Closing
   the handle alone wouldn't cancel: the kernel keeps the file object
-  alive until the I/O completes.)
+  alive until the I/O completes.) `filecat_close` does **not** close the
+  handle — `CloseHandle` is deferred to `filecat_destroy`, so a close
+  that lands between two reads cannot pull the handle out from under a
+  consumer about to reuse it. The window where `CancelIoEx` has no
+  pending I/O to abort (the consumer is between calls) is covered by the
+  `closing` latch, which `filecat_next_event` checks before each read.
 - **macOS** ([`src/platform/macos/filecat_mac.c`](../src/platform/macos/filecat_mac.c)).
   FSEvents pushes batches into a callback running on a private serial
   `dispatch_queue` (no CFRunLoop). The callback appends nodes to a
   linked-list queue under a `pthread_mutex_t`; `filecat_next_event`
   blocks on a `pthread_cond_t` attached to that queue. `filecat_close`
-  stops + invalidates + releases the stream, fences the dispatch queue
-  with `dispatch_sync_f` (so no callback can still be running against
-  the watcher), then broadcasts the condvar to wake the consumer.
+  only sets the `closing` latch and `pthread_cond_broadcast`s to wake the
+  consumer — it does **not** touch the stream. The stream teardown
+  (stop + invalidate + release) and the `dispatch_sync_f` queue fence
+  (which guarantees no callback is still running against the watcher) are
+  deferred to `filecat_destroy`, which performs them before freeing.
 
-### 6.2 Lifecycle: refcount + two latches
+### 6.2 Lifecycle: caller-managed, one latch
 
-Every watcher carries an atomic refcount plus two set-once latches,
-`closing` and `destroyed`. The model is consistent across all three
-backends and is the reason concurrent close/destroy is safe.
+Every watcher carries a single set-once latch, `closing`. There is **no
+reference count**: the watcher's memory lifetime is owned by the caller, not
+arbitrated inside the library. The model is consistent across all three
+backends.
 
 ```
-filecat_open       → refcount = 1                 (owner ref)
-filecat_next_event → retain → block → release     (refcount transiently +1)
-filecat_close      → CAS closing 0→1, wake the blocked syscall, return
-filecat_destroy    → CAS destroyed 0→1, ensure closing, release owner ref
-last release       → watcher_free()
+filecat_open       → allocate; closing = 0
+filecat_next_event → check closing → block in the backend syscall → return
+filecat_close      → set closing, wake the blocked syscall, return
+                     (does NOT release any OS resource)
+filecat_destroy    → close the native handle/fd/stream, then free
 ```
 
-Three things fall out of this model:
+Two things fall out of this model:
 
 1. **`filecat_close` from another thread interrupts an in-flight
    `filecat_next_event`.** Each backend has its own wake mechanism
    (Linux: eventfd write that `poll(2)` returns on; Windows:
    `CancelIoEx` that aborts the synchronous `ReadDirectoryChangesExW`;
-   macOS: `pthread_cond_broadcast` after the FSEvents stream is torn
-   down). All of them fire synchronously inside `filecat_close`; the
-   in-flight call observes `FILECAT_ERR_CLOSED` and returns. No spin,
-   no signal handling.
-2. **The watcher cannot be freed underneath an in-flight call.** While
-   `filecat_next_event` is parked in the backend's blocking syscall,
-   refcount ≥ 2. Even if another thread calls `filecat_destroy`
-   immediately, that call only drops the owner ref; the last release
-   (and therefore `watcher_free`) doesn't run until the consumer's
-   release also fires.
-3. **`filecat_close` and `filecat_destroy` are idempotent.** Both use
-   atomic CAS on their respective latches; the second concurrent call
-   is a no-op. This matters for cgo finalizer patterns where the
-   binding's `Close` and the runtime's finalizer can race.
+   macOS: `pthread_cond_broadcast`). All of them fire synchronously
+   inside `filecat_close`; the in-flight call observes
+   `FILECAT_ERR_CLOSED` and returns. No spin, no signal handling. The
+   `closing` latch is also checked at the top of `filecat_next_event`,
+   so a close that lands *between* two calls — when there is no blocked
+   syscall to cancel — is still observed on the next entry.
+2. **`filecat_close` is idempotent and frees nothing.** Setting the latch
+   again is a no-op, and each backend's wake primitive is safe to fire
+   repeatedly (an extra `CancelIoEx` / eventfd write / broadcast is
+   harmless). The native handle, fd, or FSEvents stream stays alive until
+   `filecat_destroy`, so a `close` racing a consumer that is between two
+   reads can never invalidate a resource the consumer is about to touch.
+
+**Why no refcount.** An in-object refcount cannot protect the object's own
+memory: `filecat_next_event` must dereference the watcher to retain it, so a
+`destroy` that frees the watcher in the window *between* a consumer's two
+calls (when it holds no ref) leaves the next call's retain dereferencing
+freed memory. Closing that gap robustly would require an external handle
+table (an indirection whose lifetime outlives the watcher) — a real cost on
+every event. Filecat instead hands the lifetime decision to the caller,
+which, being one layer up with an actual thread/goroutine to join, is in a
+far better position to know when the consumer has truly stopped. This is the
+same division of labor libuv uses (`uv_close` is async; the caller frees the
+handle only from the close callback). See §6.3 for the resulting contract.
 
 ### 6.3 The contract
 
 - **One concurrent reader per watcher.** `filecat_next_event` is **not**
   internally serialized; two threads calling it on the same watcher
   would race on the internal buffer cursor. Don't do that.
-- **`filecat_close` and `filecat_destroy` are safe from any thread, at
-  any time**, including during an in-flight `filecat_next_event`. They
-  are idempotent.
+- **`filecat_close` is safe from any thread, any number of times**,
+  including during an in-flight `filecat_next_event`. It is the *only*
+  call allowed to race a reader: it wakes the reader and frees nothing.
+- **`filecat_destroy` must be called exactly once, by a single thread,
+  after the consumer has stopped.** "Stopped" means the consumer has
+  observed `FILECAT_ERR_CLOSED` (or otherwise returned) from its final
+  `filecat_next_event` and will not call into the watcher again.
+  Destroying while another thread is inside `filecat_next_event` — or
+  touching the watcher after `filecat_destroy` — is undefined behavior.
+  The library does not reference-count in-flight calls; closing the gap
+  (close, then join the reader) is the caller's responsibility.
 - **Different watchers are fully independent** and may be driven from
   different threads with no coordination.
+
+The canonical shutdown is therefore three ordered steps:
+`filecat_close(w)` → join the consumer thread → `filecat_destroy(w)`.
+§6.4 shows it in the cgo shape the ABI was designed for.
 
 ### 6.4 The intended cgo shape
 
@@ -428,14 +458,19 @@ ctx.Done() fires
 filecat_close(w)        ───►   wake (see §6.1)
                                filecat_next_event returns ERR_CLOSED
                                worker exits
-join worker
-filecat_destroy(w)      ───►   last release → watcher_free
+join worker               ◄─── worker has fully returned here
+filecat_destroy(w)      ───►   close native handle + free
 ```
 
 This is the model the C ABI was designed for: one goroutine per watcher,
-context cancellation closes the watcher, the worker exits cleanly, the
-finalizer (or explicit `Close`) destroys. No internal locking on the C
-side, no thread attach/detach problems, no callback context confusion.
+context cancellation closes the watcher, the worker exits cleanly, and —
+**after the owner joins the worker** — `filecat_destroy` frees. The join is
+load-bearing, not decorative: it is what guarantees no `filecat_next_event`
+is in flight when `destroy` frees the watcher, which is precisely the
+guarantee the library no longer makes internally (§6.2). A cgo binding must
+join its reader goroutine before destroy; a finalizer that frees without
+joining is a use-after-free. No internal locking on the C side, no thread
+attach/detach problems, no callback context confusion.
 
 ## 7. Known limitations
 

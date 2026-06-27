@@ -191,7 +191,9 @@ int main(void) {
         }
     }
 
-    filecat_close(w);
+    filecat_close(w);     /* idempotent stop signal (no-op here, the loop
+                             already exited); shown for symmetry */
+    filecat_destroy(w);   /* release the OS handle and free the watcher */
     return 0;
 }
 ```
@@ -199,6 +201,16 @@ int main(void) {
 `filecat_next_event` is **blocking and single-threaded**. The string in
 `ev.path` is owned by the watcher and remains valid only until the next call
 to `filecat_next_event` or `filecat_close`.
+
+**Lifecycle.** `filecat_close` is the cancel signal: callable from any
+thread, any number of times, it wakes a blocked `filecat_next_event` (which
+then returns `FILECAT_ERR_CLOSED`) but frees nothing. `filecat_destroy`
+releases the OS handle and the watcher's memory. The caller owns the
+ordering — when a *separate* thread runs `filecat_next_event`, the sequence
+is `filecat_close` → **join that thread** → `filecat_destroy`. The library
+does not reference-count in-flight calls, so destroying while a consumer is
+still inside `filecat_next_event` is undefined behavior. See
+[`docs/DESIGN.md` §6](docs/DESIGN.md) for the full threading contract.
 
 `recursive` maps to Windows' `bWatchSubtree`: pass `0` to watch only the
 target directory; non-zero to watch all descendants.
